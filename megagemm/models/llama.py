@@ -4881,18 +4881,29 @@ class LlamaAttention(nn.Module):
             and k_len <= int(self.sliding_window)
         )
         if self.sliding_window <= 0:
+            e2b_l4_full_batch = int(q.shape[0]) if q.ndim == 4 else 0
+            e2b_l4_full_batch_allowed = bool(
+                e2b_l4_full_batch == 8
+                or (
+                    e2b_l4_full_batch == 4
+                    and _env_enabled(
+                        "MEGAGEMM_GEMMA4_E2B_L4_B4_PREFILL_EXPERIMENT",
+                        default=False,
+                    )
+                )
+            )
             use_e2b_l4_expanded_full = bool(
                 implicit_causal
                 and self._gemma4_e2b_l4_full_prefill_expand_enabled
                 and q.ndim == 4
                 and k.ndim == 4
                 and v.ndim == 4
-                and int(q.shape[0]) == 8
+                and e2b_l4_full_batch_allowed
                 and int(q.shape[1]) == 8
                 and 2048 <= q_len <= 2304
                 and q_len == k_len
                 and int(q.shape[3]) == 512
-                and tuple(k.shape) == (8, 1, q_len, 512)
+                and tuple(k.shape) == (e2b_l4_full_batch, 1, q_len, 512)
                 and tuple(v.shape) == tuple(k.shape)
                 and q.dtype == torch.bfloat16
                 and k.dtype == q.dtype

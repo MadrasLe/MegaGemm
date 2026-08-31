@@ -4461,10 +4461,12 @@ def gemma4_e2b_l4_sliding_prefill_attention(
     """Experimental exact-shape kernel for Gemma 4 E2B on NVIDIA L4.
 
     This path is deliberately narrower than the older A100/A4B long-prefill
-    kernels: BF16, B8, Q8/KV1, S2048..2304, H256, W512, and L4 only.  The
-    bounded sequence range includes the chat-template tokens added to the
-    publication workload. Runtime use is controlled by the model-level
-    experiment flag; ``force`` exists solely for the isolated tuning harness.
+    kernels: BF16, B8, Q8/KV1, S2048..2304, H256, W512, and L4 only in
+    production.  B4 is available behind a separate experiment flag so its
+    launch geometry can be selected by a loaded-model gate without changing
+    the promoted B8 policy.  The bounded sequence range includes the
+    chat-template tokens added to the publication workload. ``force`` exists
+    solely for tuning harnesses.
     """
     global _GEMMA4_E2B_L4_SLIDING_PREFILL_DISABLED
     global _GEMMA4_E2B_L4_SLIDING_PREFILL_FAILURE
@@ -4483,12 +4485,22 @@ def gemma4_e2b_l4_sliding_prefill_attention(
         return None
 
     batch_size, num_q_heads, seq_len, head_dim = q.shape
-    if tuple(k.shape) != (8, 1, seq_len, 256):
+    b4_experimental = bool(
+        batch_size == 4
+        and (
+            force
+            or _env_bool(
+                "MEGAGEMM_GEMMA4_E2B_L4_B4_PREFILL_EXPERIMENT",
+                False,
+            )
+        )
+    )
+    if tuple(k.shape) != (batch_size, 1, seq_len, 256):
         return None
     if tuple(v.shape) != tuple(k.shape):
         return None
     if (
-        batch_size != 8
+        (batch_size != 8 and not b4_experimental)
         or num_q_heads != 8
         or seq_len < 2048
         or seq_len > 2304
@@ -4501,30 +4513,35 @@ def gemma4_e2b_l4_sliding_prefill_attention(
     if "l4" not in _device_name_tokens(device_name):
         return None
 
+    env_prefix = (
+        "MEGAGEMM_GEMMA4_E2B_L4_B4_SLIDING_"
+        if batch_size == 4
+        else "MEGAGEMM_GEMMA4_E2B_L4_SLIDING_"
+    )
     group_heads = int(
         group_heads
         if group_heads is not None
-        else _env_int("MEGAGEMM_GEMMA4_E2B_L4_SLIDING_GROUP_HEADS", 4)
+        else _env_int(env_prefix + "GROUP_HEADS", 4)
     )
     block_m = int(
         block_m
         if block_m is not None
-        else _env_int("MEGAGEMM_GEMMA4_E2B_L4_SLIDING_BLOCK_M", 8)
+        else _env_int(env_prefix + "BLOCK_M", 8)
     )
     block_n = int(
         block_n
         if block_n is not None
-        else _env_int("MEGAGEMM_GEMMA4_E2B_L4_SLIDING_BLOCK_N", 64)
+        else _env_int(env_prefix + "BLOCK_N", 64)
     )
     num_warps = int(
         num_warps
         if num_warps is not None
-        else _env_int("MEGAGEMM_GEMMA4_E2B_L4_SLIDING_NUM_WARPS", 4)
+        else _env_int(env_prefix + "NUM_WARPS", 4)
     )
     num_stages = int(
         num_stages
         if num_stages is not None
-        else _env_int("MEGAGEMM_GEMMA4_E2B_L4_SLIDING_NUM_STAGES", 2)
+        else _env_int(env_prefix + "NUM_STAGES", 2)
     )
     block_rows = int(group_heads * block_m)
     if (
@@ -4585,7 +4602,10 @@ def gemma4_e2b_l4_sliding_prefill_attention(
         _GEMMA4_E2B_L4_SLIDING_PREFILL_FAILURE = (
             f"{type(exc).__name__}: {exc}"
         )
-        if not force:
+        # A rejected B4 tuning candidate must not disable the already-promoted
+        # B8 production path or prevent later B4 geometries in the same loaded
+        # model from being evaluated.
+        if not force and not b4_experimental:
             _GEMMA4_E2B_L4_SLIDING_PREFILL_DISABLED = True
         if not _GEMMA4_E2B_L4_SLIDING_PREFILL_LOGGED:
             _GEMMA4_E2B_L4_SLIDING_PREFILL_LOGGED = True
@@ -4601,7 +4621,7 @@ def gemma4_e2b_l4_sliding_prefill_attention(
         _GEMMA4_E2B_L4_SLIDING_PREFILL_LOGGED = True
         print(
             "[MegaGemm] Gemma4 E2B/L4 sliding prefill active: "
-            f"B8 S{seq_len} Q8/KV1 H256 W512 group_heads={group_heads} "
+            f"B{batch_size} S{seq_len} Q8/KV1 H256 W512 group_heads={group_heads} "
             f"block_m={block_m} block_n={block_n} warps={num_warps}"
         )
     return output

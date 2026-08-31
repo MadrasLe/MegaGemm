@@ -30,15 +30,17 @@ def test_e2b_l4_candidate_rejects_non_cuda_without_allocating_output():
     ) is None
 
 
-def test_e2b_l4_kernel_and_runtime_gate_are_exact_shape_only():
+def test_e2b_l4_kernel_keeps_b8_production_exact_and_b4_experimental():
     kernel = KERNEL.read_text(encoding="utf-8")
     model = MODEL.read_text(encoding="utf-8")
 
     for expected in (
         "def _gemma4_e2b_l4_sliding_prefill_kernel(",
         "def gemma4_e2b_l4_sliding_prefill_attention(",
-        "tuple(k.shape) != (8, 1, seq_len, 256)",
-        "batch_size != 8",
+        "tuple(k.shape) != (batch_size, 1, seq_len, 256)",
+        "(batch_size != 8 and not b4_experimental)",
+        'batch_size == 4',
+        '"MEGAGEMM_GEMMA4_E2B_L4_B4_PREFILL_EXPERIMENT"',
         "num_q_heads != 8",
         "seq_len < 2048",
         "seq_len > 2304",
@@ -46,9 +48,11 @@ def test_e2b_l4_kernel_and_runtime_gate_are_exact_shape_only():
         'if "l4" not in _device_name_tokens(device_name):',
         "GROUP_HEADS=group_heads",
         "BLOCK_ROWS=block_rows",
-        '"MEGAGEMM_GEMMA4_E2B_L4_SLIDING_GROUP_HEADS", 4',
-        '"MEGAGEMM_GEMMA4_E2B_L4_SLIDING_BLOCK_M", 8',
-        '"MEGAGEMM_GEMMA4_E2B_L4_SLIDING_NUM_WARPS", 4',
+        '"MEGAGEMM_GEMMA4_E2B_L4_B4_SLIDING_"',
+        '"MEGAGEMM_GEMMA4_E2B_L4_SLIDING_"',
+        'env_prefix + "GROUP_HEADS", 4',
+        'env_prefix + "BLOCK_M", 8',
+        'env_prefix + "NUM_WARPS", 4',
     ):
         assert expected in kernel
 
