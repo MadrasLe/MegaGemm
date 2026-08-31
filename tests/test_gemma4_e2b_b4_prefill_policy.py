@@ -17,22 +17,20 @@ def _load_module():
     return module
 
 
-def test_b4_prefill_experiment_is_separate_from_promoted_b8_policy():
+def test_promoted_b4_prefill_is_shape_scoped_and_keeps_distinct_tiles():
     paged = (ROOT / "megagemm" / "kernels" / "paged_attention.py").read_text(
         encoding="utf-8"
     )
     model = (ROOT / "megagemm" / "models" / "llama.py").read_text(
         encoding="utf-8"
     )
-    flag = "MEGAGEMM_GEMMA4_E2B_L4_B4_PREFILL_EXPERIMENT"
-    assert flag in paged
-    assert flag in model
-    assert 'if batch_size == 4' in paged
-    assert '(batch_size != 8 and not b4_experimental)' in paged
+    assert 'batch_size not in (4, 8)' in paged
     assert 'tuple(k.shape) != (batch_size, 1, seq_len, 256)' in paged
     assert 'else "MEGAGEMM_GEMMA4_E2B_L4_SLIDING_"' in paged
-    assert "e2b_l4_full_batch == 8" in model
-    assert "e2b_l4_full_batch == 4" in model
+    assert 'default_group_heads = 2 if batch_size == 4 else 4' in paged
+    assert 'default_block_m = 16 if batch_size == 4 else 8' in paged
+    assert 'e2b_l4_full_batch in (4, 8)' in model
+    assert '2048 <= q_len <= 2304' in model
 
 
 def test_policy_gate_covers_attribution_and_distinct_b4_tiles():

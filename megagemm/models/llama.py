@@ -4882,16 +4882,10 @@ class LlamaAttention(nn.Module):
         )
         if self.sliding_window <= 0:
             e2b_l4_full_batch = int(q.shape[0]) if q.ndim == 4 else 0
-            e2b_l4_full_batch_allowed = bool(
-                e2b_l4_full_batch == 8
-                or (
-                    e2b_l4_full_batch == 4
-                    and _env_enabled(
-                        "MEGAGEMM_GEMMA4_E2B_L4_B4_PREFILL_EXPERIMENT",
-                        default=False,
-                    )
-                )
-            )
+            # Loaded-model gates independently validated B4 and B8 on L4.
+            # The remaining guards keep this promotion on the exact E2B BF16
+            # long-context topology and leave B1/B2 on their generic paths.
+            e2b_l4_full_batch_allowed = e2b_l4_full_batch in (4, 8)
             use_e2b_l4_expanded_full = bool(
                 implicit_causal
                 and self._gemma4_e2b_l4_full_prefill_expand_enabled

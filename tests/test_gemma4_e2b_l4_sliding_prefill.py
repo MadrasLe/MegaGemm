@@ -30,7 +30,7 @@ def test_e2b_l4_candidate_rejects_non_cuda_without_allocating_output():
     ) is None
 
 
-def test_e2b_l4_kernel_keeps_b8_production_exact_and_b4_experimental():
+def test_e2b_l4_kernel_keeps_b4_and_b8_production_dispatches_exact():
     kernel = KERNEL.read_text(encoding="utf-8")
     model = MODEL.read_text(encoding="utf-8")
 
@@ -38,9 +38,7 @@ def test_e2b_l4_kernel_keeps_b8_production_exact_and_b4_experimental():
         "def _gemma4_e2b_l4_sliding_prefill_kernel(",
         "def gemma4_e2b_l4_sliding_prefill_attention(",
         "tuple(k.shape) != (batch_size, 1, seq_len, 256)",
-        "(batch_size != 8 and not b4_experimental)",
-        'batch_size == 4',
-        '"MEGAGEMM_GEMMA4_E2B_L4_B4_PREFILL_EXPERIMENT"',
+        'batch_size not in (4, 8)',
         "num_q_heads != 8",
         "seq_len < 2048",
         "seq_len > 2304",
@@ -50,9 +48,12 @@ def test_e2b_l4_kernel_keeps_b8_production_exact_and_b4_experimental():
         "BLOCK_ROWS=block_rows",
         '"MEGAGEMM_GEMMA4_E2B_L4_B4_SLIDING_"',
         '"MEGAGEMM_GEMMA4_E2B_L4_SLIDING_"',
-        'env_prefix + "GROUP_HEADS", 4',
-        'env_prefix + "BLOCK_M", 8',
+        'default_group_heads = 2 if batch_size == 4 else 4',
+        'default_block_m = 16 if batch_size == 4 else 8',
+        'env_prefix + "GROUP_HEADS", default_group_heads',
+        'env_prefix + "BLOCK_M", default_block_m',
         'env_prefix + "NUM_WARPS", 4',
+        '_GEMMA4_E2B_L4_B4_SLIDING_PREFILL_DISABLED',
     ):
         assert expected in kernel
 

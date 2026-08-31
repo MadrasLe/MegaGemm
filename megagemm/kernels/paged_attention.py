@@ -64,6 +64,7 @@ _GEMMA4_LONG_FULL_PREFILL_DISABLED = False
 _GEMMA4_LONG_FULL_PREFILL_FAILURE = ""
 _GEMMA4_LONG_FULL_PREFILL_LOGGED = False
 _GEMMA4_E2B_L4_SLIDING_PREFILL_DISABLED = False
+_GEMMA4_E2B_L4_B4_SLIDING_PREFILL_DISABLED = False
 _GEMMA4_E2B_L4_SLIDING_PREFILL_FAILURE = ""
 _GEMMA4_E2B_L4_SLIDING_PREFILL_LOGGED = False
 _GEMMA4_E2B_L4_SLIDING_PREFILL_HITS = 0
@@ -4458,17 +4459,16 @@ def gemma4_e2b_l4_sliding_prefill_attention(
     num_stages: Optional[int] = None,
     force: bool = False,
 ) -> Optional[torch.Tensor]:
-    """Experimental exact-shape kernel for Gemma 4 E2B on NVIDIA L4.
+    """Exact-shape production kernel for Gemma 4 E2B on NVIDIA L4.
 
     This path is deliberately narrower than the older A100/A4B long-prefill
-    kernels: BF16, B8, Q8/KV1, S2048..2304, H256, W512, and L4 only in
-    production.  B4 is available behind a separate experiment flag so its
-    launch geometry can be selected by a loaded-model gate without changing
-    the promoted B8 policy.  The bounded sequence range includes the
-    chat-template tokens added to the publication workload. ``force`` exists
-    solely for tuning harnesses.
+    kernels: BF16, B4/B8, Q8/KV1, S2048..2304, H256, W512, and L4 only in
+    production. B4 and B8 use independently measured launch geometries. The
+    bounded sequence range includes the chat-template tokens added to the
+    publication workload. ``force`` exists solely for tuning harnesses.
     """
     global _GEMMA4_E2B_L4_SLIDING_PREFILL_DISABLED
+    global _GEMMA4_E2B_L4_B4_SLIDING_PREFILL_DISABLED
     global _GEMMA4_E2B_L4_SLIDING_PREFILL_FAILURE
     global _GEMMA4_E2B_L4_SLIDING_PREFILL_LOGGED
     global _GEMMA4_E2B_L4_SLIDING_PREFILL_HITS
@@ -4485,22 +4485,18 @@ def gemma4_e2b_l4_sliding_prefill_attention(
         return None
 
     batch_size, num_q_heads, seq_len, head_dim = q.shape
-    b4_experimental = bool(
+    if (
         batch_size == 4
-        and (
-            force
-            or _env_bool(
-                "MEGAGEMM_GEMMA4_E2B_L4_B4_PREFILL_EXPERIMENT",
-                False,
-            )
-        )
-    )
+        and _GEMMA4_E2B_L4_B4_SLIDING_PREFILL_DISABLED
+        and not force
+    ):
+        return None
     if tuple(k.shape) != (batch_size, 1, seq_len, 256):
         return None
     if tuple(v.shape) != tuple(k.shape):
         return None
     if (
-        (batch_size != 8 and not b4_experimental)
+        batch_size not in (4, 8)
         or num_q_heads != 8
         or seq_len < 2048
         or seq_len > 2304
@@ -4518,15 +4514,17 @@ def gemma4_e2b_l4_sliding_prefill_attention(
         if batch_size == 4
         else "MEGAGEMM_GEMMA4_E2B_L4_SLIDING_"
     )
+    default_group_heads = 2 if batch_size == 4 else 4
+    default_block_m = 16 if batch_size == 4 else 8
     group_heads = int(
         group_heads
         if group_heads is not None
-        else _env_int(env_prefix + "GROUP_HEADS", 4)
+        else _env_int(env_prefix + "GROUP_HEADS", default_group_heads)
     )
     block_m = int(
         block_m
         if block_m is not None
-        else _env_int(env_prefix + "BLOCK_M", 8)
+        else _env_int(env_prefix + "BLOCK_M", default_block_m)
     )
     block_n = int(
         block_n
@@ -4602,11 +4600,13 @@ def gemma4_e2b_l4_sliding_prefill_attention(
         _GEMMA4_E2B_L4_SLIDING_PREFILL_FAILURE = (
             f"{type(exc).__name__}: {exc}"
         )
-        # A rejected B4 tuning candidate must not disable the already-promoted
-        # B8 production path or prevent later B4 geometries in the same loaded
-        # model from being evaluated.
-        if not force and not b4_experimental:
-            _GEMMA4_E2B_L4_SLIDING_PREFILL_DISABLED = True
+        # B4 and B8 have distinct production geometries. A failure disables
+        # only the affected dispatch instead of poisoning the other batch.
+        if not force:
+            if batch_size == 4:
+                _GEMMA4_E2B_L4_B4_SLIDING_PREFILL_DISABLED = True
+            else:
+                _GEMMA4_E2B_L4_SLIDING_PREFILL_DISABLED = True
         if not _GEMMA4_E2B_L4_SLIDING_PREFILL_LOGGED:
             _GEMMA4_E2B_L4_SLIDING_PREFILL_LOGGED = True
             print(

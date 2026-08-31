@@ -328,26 +328,26 @@ def measure(args: argparse.Namespace) -> dict[str, Any]:
     print("  model loads: 1", flush=True)
     runner = matrix.make_runner(_runner_args(args, batches), tokenizer)
 
-    warmup_output = max(outputs)
     for batch in batches:
         for prompt in prompts_requested:
             prompts, actual = prompt_cache[(batch, prompt)]
-            for warmup in range(args.warmups):
-                print(
-                    f"Warmup b={batch} p={prompt} o={warmup_output} "
-                    f"{warmup + 1}/{args.warmups}",
-                    flush=True,
-                )
-                _sample(
-                    runner,
-                    prompts,
-                    batch=batch,
-                    prompt=prompt,
-                    prompt_actual=actual,
-                    output=warmup_output,
-                    repeat=-(warmup + 1),
-                    order_position=0,
-                )
+            for output in outputs:
+                for warmup in range(args.warmups):
+                    print(
+                        f"Warmup b={batch} p={prompt} o={output} "
+                        f"{warmup + 1}/{args.warmups}",
+                        flush=True,
+                    )
+                    _sample(
+                        runner,
+                        prompts,
+                        batch=batch,
+                        prompt=prompt,
+                        prompt_actual=actual,
+                        output=output,
+                        repeat=-(warmup + 1),
+                        order_position=0,
+                    )
 
     base_schedule = [
         (batch, prompt, output)
@@ -404,7 +404,7 @@ def measure(args: argparse.Namespace) -> dict[str, Any]:
         },
         "method": {
             "model_loads": 1,
-            "warmup_per_batch_prompt": args.warmups,
+            "warmup_per_scenario": args.warmups,
             "repeats": args.repeats,
             "schedule": "alternating-direction rotated full matrix",
             "incremental_decode": "paired wall-time delta against o1 in the same repeat",

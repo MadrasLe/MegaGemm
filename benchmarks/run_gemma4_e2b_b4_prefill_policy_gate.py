@@ -143,6 +143,7 @@ def _sample(
     from megagemm.kernels import paged_attention
 
     _set_case(full_modules, sliding_modules, case)
+    paged_attention._GEMMA4_E2B_L4_B4_SLIDING_PREFILL_DISABLED = False
     paged_attention._GEMMA4_E2B_L4_SLIDING_PREFILL_FAILURE = ""
     before_full = _hits(full_modules, "_gemma4_e2b_l4_full_prefill_expand_hits")
     before_sliding = _hits(sliding_modules, "_gemma4_e2b_l4_sliding_prefill_hits")
@@ -287,7 +288,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"this gate requires NVIDIA L4, found {gpu}")
 
     profile = _configure_megagemm_profile(args.model)
-    os.environ["MEGAGEMM_GEMMA4_E2B_L4_B4_PREFILL_EXPERIMENT"] = "1"
     os.environ["MEGAGEMM_BENCHMARK_TOKEN_DIGEST"] = "1"
     engine = InferenceEngine(
         args.model,

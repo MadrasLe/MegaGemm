@@ -188,3 +188,10 @@ def test_colab_harness_is_drive_scoped_and_does_not_mutate_environment():
     assert "COMPARE_WITH" in source
     assert 'if [[ -f "$OUT/comparison.json" ]]' in source
     assert source.rstrip().endswith("exit 0")
+
+
+def test_macro_warms_every_scenario_before_measurement():
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "for output in outputs:" in source
+    assert '"warmup_per_scenario": args.warmups' in source
+    assert "warmup_output = max(outputs)" not in source
