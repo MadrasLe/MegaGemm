@@ -64,6 +64,7 @@ _GEMMA4_LONG_FULL_PREFILL_DISABLED = False
 _GEMMA4_LONG_FULL_PREFILL_FAILURE = ""
 _GEMMA4_LONG_FULL_PREFILL_LOGGED = False
 _GEMMA4_E2B_L4_SLIDING_PREFILL_DISABLED = False
+_GEMMA4_E2B_L4_B2_SLIDING_PREFILL_DISABLED = False
 _GEMMA4_E2B_L4_B4_SLIDING_PREFILL_DISABLED = False
 _GEMMA4_E2B_L4_SLIDING_PREFILL_FAILURE = ""
 _GEMMA4_E2B_L4_SLIDING_PREFILL_LOGGED = False
@@ -4463,11 +4464,14 @@ def gemma4_e2b_l4_sliding_prefill_attention(
 
     This path is deliberately narrower than the older A100/A4B long-prefill
     kernels: BF16, B4/B8, Q8/KV1, S2048..2304, H256, W512, and L4 only in
-    production. B4 and B8 use independently measured launch geometries. The
-    bounded sequence range includes the chat-template tokens added to the
-    publication workload. ``force`` exists solely for tuning harnesses.
+    production. B2 is admitted only by its loaded-model tuning flag until a
+    launch geometry is promoted. B4 and B8 use independently measured launch
+    geometries. The bounded sequence range includes the chat-template tokens
+    added to the publication workload. ``force`` exists solely for tuning
+    harnesses.
     """
     global _GEMMA4_E2B_L4_SLIDING_PREFILL_DISABLED
+    global _GEMMA4_E2B_L4_B2_SLIDING_PREFILL_DISABLED
     global _GEMMA4_E2B_L4_B4_SLIDING_PREFILL_DISABLED
     global _GEMMA4_E2B_L4_SLIDING_PREFILL_FAILURE
     global _GEMMA4_E2B_L4_SLIDING_PREFILL_LOGGED
@@ -4485,6 +4489,22 @@ def gemma4_e2b_l4_sliding_prefill_attention(
         return None
 
     batch_size, num_q_heads, seq_len, head_dim = q.shape
+    b2_experimental = bool(
+        batch_size == 2
+        and (
+            force
+            or _env_bool(
+                "MEGAGEMM_GEMMA4_E2B_L4_B2_PREFILL_EXPERIMENT",
+                False,
+            )
+        )
+    )
+    if (
+        batch_size == 2
+        and _GEMMA4_E2B_L4_B2_SLIDING_PREFILL_DISABLED
+        and not force
+    ):
+        return None
     if (
         batch_size == 4
         and _GEMMA4_E2B_L4_B4_SLIDING_PREFILL_DISABLED
@@ -4496,7 +4516,7 @@ def gemma4_e2b_l4_sliding_prefill_attention(
     if tuple(v.shape) != tuple(k.shape):
         return None
     if (
-        batch_size not in (4, 8)
+        (batch_size not in (4, 8) and not b2_experimental)
         or num_q_heads != 8
         or seq_len < 2048
         or seq_len > 2304
@@ -4509,13 +4529,15 @@ def gemma4_e2b_l4_sliding_prefill_attention(
     if "l4" not in _device_name_tokens(device_name):
         return None
 
-    env_prefix = (
-        "MEGAGEMM_GEMMA4_E2B_L4_B4_SLIDING_"
-        if batch_size == 4
-        else "MEGAGEMM_GEMMA4_E2B_L4_SLIDING_"
-    )
-    default_group_heads = 2 if batch_size == 4 else 4
-    default_block_m = 16 if batch_size == 4 else 8
+    if batch_size == 2:
+        env_prefix = "MEGAGEMM_GEMMA4_E2B_L4_B2_SLIDING_"
+        default_group_heads, default_block_m = 1, 16
+    elif batch_size == 4:
+        env_prefix = "MEGAGEMM_GEMMA4_E2B_L4_B4_SLIDING_"
+        default_group_heads, default_block_m = 2, 16
+    else:
+        env_prefix = "MEGAGEMM_GEMMA4_E2B_L4_SLIDING_"
+        default_group_heads, default_block_m = 4, 8
     group_heads = int(
         group_heads
         if group_heads is not None
@@ -4603,7 +4625,9 @@ def gemma4_e2b_l4_sliding_prefill_attention(
         # B4 and B8 have distinct production geometries. A failure disables
         # only the affected dispatch instead of poisoning the other batch.
         if not force:
-            if batch_size == 4:
+            if batch_size == 2:
+                _GEMMA4_E2B_L4_B2_SLIDING_PREFILL_DISABLED = True
+            elif batch_size == 4:
                 _GEMMA4_E2B_L4_B4_SLIDING_PREFILL_DISABLED = True
             else:
                 _GEMMA4_E2B_L4_SLIDING_PREFILL_DISABLED = True
