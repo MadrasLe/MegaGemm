@@ -4885,7 +4885,16 @@ class LlamaAttention(nn.Module):
             # Loaded-model gates independently validated B4 and B8 on L4.
             # The remaining guards keep this promotion on the exact E2B BF16
             # long-context topology and leave B1/B2 on their generic paths.
-            e2b_l4_full_batch_allowed = e2b_l4_full_batch in (2, 4, 8)
+            e2b_l4_full_batch_allowed = bool(
+                e2b_l4_full_batch in (2, 4, 8)
+                or (
+                    e2b_l4_full_batch == 1
+                    and _env_enabled(
+                        "MEGAGEMM_GEMMA4_E2B_L4_B1_PREFILL_EXPERIMENT",
+                        default=False,
+                    )
+                )
+            )
             use_e2b_l4_expanded_full = bool(
                 implicit_causal
                 and self._gemma4_e2b_l4_full_prefill_expand_enabled
@@ -14561,6 +14570,12 @@ class MegaGemmLlama(nn.Module):
             hidden, k_cache, v_cache, next_linear_conv, next_linear_recurrent = layer(
                 hidden, cos, sin, positions,
                 is_prefill=True,
+                # A single prompt is dense and has no padding. Propagate the
+                # same causal fact used by uniform prefill_batch so Gemma 4's
+                # exact-shape long-prefill dispatchers can serve B1 as well.
+                implicit_causal_prefill=(
+                    self.config.model_type == 'gemma4_text'
+                ),
                 linear_conv_state=linear_conv_state,
                 linear_recurrent_state=linear_recurrent_state,
                 use_linear_cache=True,

@@ -38,7 +38,13 @@ from benchmarks.run_gemma4_e2b_phase_split import (
 
 BATCH_SIZE = 2
 PROMPT_TOKENS = 2048
+EXPERIMENT_FLAG: str | None = None
 TILE_PREFIX = "MEGAGEMM_GEMMA4_E2B_L4_B2_SLIDING_"
+DISABLED_ATTR = "_GEMMA4_E2B_L4_B2_SLIDING_PREFILL_DISABLED"
+BATCH_LABEL = "B2"
+BENCHMARK_NAME = "gemma4_e2b_l4_b2_prefill_policy_gate"
+READY_DECISION = "IMPLEMENT_B2_POLICY_AND_RUN_TARGETED_MACRO_GATE"
+KEEP_DECISION = "KEEP_B2_BASELINE"
 
 # (group_heads, block_m, block_n, num_warps, num_stages)
 CASES: tuple[dict[str, Any], ...] = (
@@ -157,7 +163,7 @@ def _sample(
     from megagemm.kernels import paged_attention
 
     _set_case(full_modules, sliding_modules, case)
-    paged_attention._GEMMA4_E2B_L4_B2_SLIDING_PREFILL_DISABLED = False
+    setattr(paged_attention, DISABLED_ATTR, False)
     paged_attention._GEMMA4_E2B_L4_SLIDING_PREFILL_FAILURE = ""
     before_full = _hits(full_modules, "_gemma4_e2b_l4_full_prefill_expand_hits")
     before_sliding = _hits(sliding_modules, "_gemma4_e2b_l4_sliding_prefill_hits")
@@ -275,9 +281,9 @@ def summarize(
     ready = bool(token_digest_exact and winner and speedup >= minimum_speedup)
     return {
         "decision": (
-            "IMPLEMENT_B2_POLICY_AND_RUN_TARGETED_MACRO_GATE"
+            READY_DECISION
             if ready
-            else "KEEP_B2_BASELINE"
+            else KEEP_DECISION
         ),
         "candidate_ready": ready,
         "winner": winner_name,
@@ -304,6 +310,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"this gate requires NVIDIA L4, found {gpu}")
 
     profile = _configure_megagemm_profile(args.model)
+    if EXPERIMENT_FLAG:
+        os.environ[EXPERIMENT_FLAG] = "1"
+        profile[EXPERIMENT_FLAG] = "1"
     os.environ["MEGAGEMM_BENCHMARK_TOKEN_DIGEST"] = "1"
     engine = InferenceEngine(
         args.model,
@@ -329,7 +338,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             f"{len(full_modules)} and {len(sliding_modules)}"
         )
 
-    print("Gemma 4 E2B/L4 B2/P2048 full-model prefill policy gate")
+    print(f"Gemma 4 E2B/L4 {BATCH_LABEL}/P2048 full-model prefill policy gate")
     print(f"  gpu: {gpu}")
     print(f"  model: {args.model}")
     print(f"  prompt tokens: {actual_tokens} total")
@@ -384,7 +393,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         maximum_spread=args.maximum_spread,
     )
     payload = {
-        "benchmark": "gemma4_e2b_l4_b2_prefill_policy_gate",
+        "benchmark": BENCHMARK_NAME,
         "model": args.model,
         "gpu": gpu,
         "torch": torch.__version__,
@@ -407,7 +416,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    print("\nB2/P2048 FULL-MODEL PREFILL POLICY")
+    print(f"\n{BATCH_LABEL}/P2048 FULL-MODEL PREFILL POLICY")
     print(f"{'case':<42} {'prefill ms':>12} {'speedup':>10} {'full':>7} {'slide':>7}")
     baseline_ms = float(summary["baseline_prefill_ms"])
     for name, row in summary["cases"].items():
