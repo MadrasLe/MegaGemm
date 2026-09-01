@@ -97,13 +97,15 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
                 "the MLP gate "
                 "retains cuBLAS for gate-up and down instead of the slower "
                 "fused gate-up and deepfusion MLP kernels, while "
-                "long sliding prefill uses independently measured B4 and B8 "
-                "Q8/KV1/H256/W512 Triton launch geometries; long full-H512 "
+                "long sliding prefill uses independently measured B2, B4, "
+                "and B8 Q8/KV1/H256/W512 Triton launch geometries; long full-H512 "
                 "prefill expands the single KV head once per layer and uses "
                 "implicit-causal SDPA. The exact-output B4/P2048 loaded-model "
                 "gate promoted G2/BM16/BN64/W4/S2 after reducing prefill from "
                 "2180.93 ms to 913.50 ms (2.387x), while the B8 dispatch "
-                "remains unchanged"
+                "remains unchanged. The exact-output B2/P2048 gate independently "
+                "selected the same G2/BM16/BN64/W4/S2 geometry and reduced "
+                "prefill from 1078.41 ms to 447.18 ms (2.412x)"
             ),
         )
     if topology == (42, 2560, 8, 2):

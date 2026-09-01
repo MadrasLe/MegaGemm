@@ -38,7 +38,7 @@ def test_e2b_l4_kernel_keeps_b4_and_b8_production_dispatches_exact():
         "def _gemma4_e2b_l4_sliding_prefill_kernel(",
         "def gemma4_e2b_l4_sliding_prefill_attention(",
         "tuple(k.shape) != (batch_size, 1, seq_len, 256)",
-        'batch_size not in (4, 8)',
+        'batch_size not in (2, 4, 8)',
         "num_q_heads != 8",
         "seq_len < 2048",
         "seq_len > 2304",

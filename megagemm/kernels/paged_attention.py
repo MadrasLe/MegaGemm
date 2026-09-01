@@ -4463,10 +4463,9 @@ def gemma4_e2b_l4_sliding_prefill_attention(
     """Exact-shape production kernel for Gemma 4 E2B on NVIDIA L4.
 
     This path is deliberately narrower than the older A100/A4B long-prefill
-    kernels: BF16, B4/B8, Q8/KV1, S2048..2304, H256, W512, and L4 only in
-    production. B2 is admitted only by its loaded-model tuning flag until a
-    launch geometry is promoted. B4 and B8 use independently measured launch
-    geometries. The bounded sequence range includes the chat-template tokens
+    kernels: BF16, B2/B4/B8, Q8/KV1, S2048..2304, H256, W512, and L4 only in
+    production. Every admitted batch uses a loaded-model measured launch
+    geometry. The bounded sequence range includes the chat-template tokens
     added to the publication workload. ``force`` exists solely for tuning
     harnesses.
     """
@@ -4489,16 +4488,6 @@ def gemma4_e2b_l4_sliding_prefill_attention(
         return None
 
     batch_size, num_q_heads, seq_len, head_dim = q.shape
-    b2_experimental = bool(
-        batch_size == 2
-        and (
-            force
-            or _env_bool(
-                "MEGAGEMM_GEMMA4_E2B_L4_B2_PREFILL_EXPERIMENT",
-                False,
-            )
-        )
-    )
     if (
         batch_size == 2
         and _GEMMA4_E2B_L4_B2_SLIDING_PREFILL_DISABLED
@@ -4516,7 +4505,7 @@ def gemma4_e2b_l4_sliding_prefill_attention(
     if tuple(v.shape) != tuple(k.shape):
         return None
     if (
-        (batch_size not in (4, 8) and not b2_experimental)
+        batch_size not in (2, 4, 8)
         or num_q_heads != 8
         or seq_len < 2048
         or seq_len > 2304
@@ -4531,7 +4520,7 @@ def gemma4_e2b_l4_sliding_prefill_attention(
 
     if batch_size == 2:
         env_prefix = "MEGAGEMM_GEMMA4_E2B_L4_B2_SLIDING_"
-        default_group_heads, default_block_m = 1, 16
+        default_group_heads, default_block_m = 2, 16
     elif batch_size == 4:
         env_prefix = "MEGAGEMM_GEMMA4_E2B_L4_B4_SLIDING_"
         default_group_heads, default_block_m = 2, 16

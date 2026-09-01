@@ -24,12 +24,12 @@ def test_promoted_b4_prefill_is_shape_scoped_and_keeps_distinct_tiles():
     model = (ROOT / "megagemm" / "models" / "llama.py").read_text(
         encoding="utf-8"
     )
-    assert 'batch_size not in (4, 8)' in paged
+    assert 'batch_size not in (2, 4, 8)' in paged
     assert 'tuple(k.shape) != (batch_size, 1, seq_len, 256)' in paged
     assert 'env_prefix = "MEGAGEMM_GEMMA4_E2B_L4_B4_SLIDING_"' in paged
     assert 'default_group_heads, default_block_m = 2, 16' in paged
     assert 'default_group_heads, default_block_m = 4, 8' in paged
-    assert 'e2b_l4_full_batch in (4, 8)' in model
+    assert 'e2b_l4_full_batch in (2, 4, 8)' in model
     assert '2048 <= q_len <= 2304' in model
 
 

@@ -38,7 +38,6 @@ from benchmarks.run_gemma4_e2b_phase_split import (
 
 BATCH_SIZE = 2
 PROMPT_TOKENS = 2048
-EXPERIMENT_FLAG = "MEGAGEMM_GEMMA4_E2B_L4_B2_PREFILL_EXPERIMENT"
 TILE_PREFIX = "MEGAGEMM_GEMMA4_E2B_L4_B2_SLIDING_"
 
 # (group_heads, block_m, block_n, num_warps, num_stages)
@@ -305,9 +304,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"this gate requires NVIDIA L4, found {gpu}")
 
     profile = _configure_megagemm_profile(args.model)
-    os.environ[EXPERIMENT_FLAG] = "1"
     os.environ["MEGAGEMM_BENCHMARK_TOKEN_DIGEST"] = "1"
-    profile[EXPERIMENT_FLAG] = "1"
     engine = InferenceEngine(
         args.model,
         dtype=torch.bfloat16,
