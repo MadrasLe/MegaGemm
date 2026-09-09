@@ -22,7 +22,7 @@ from typing import Any, List, Optional, Union, Dict, Tuple
 
 from ..models.loader import load_from_hf
 from ..models.llama import LlamaConfig
-from ..models.runtime_policy import policy_bool
+from ..models.runtime_policy import policy_bool, policy_rows
 from ..models.mgx import (
     MGXFormatError,
     _collect_tokenizer_hashes,
@@ -70,6 +70,30 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except Exception:
         return default
+
+
+def _request_scheduler_reuse_for_batch(model: Any, batch_size: int) -> bool:
+    """Resolve global/env reuse while allowing policy-scoped batch sizes."""
+    env_name = "MEGAGEMM_REUSE_REQUEST_SCHEDULER"
+    if env_name in os.environ:
+        return policy_bool(
+            model,
+            env_name,
+            "reuse_request_scheduler",
+            default=False,
+        )
+    if policy_bool(
+        model,
+        env_name,
+        "reuse_request_scheduler",
+        default=False,
+    ):
+        return True
+    return int(batch_size) in policy_rows(
+        model,
+        env_name,
+        "reuse_request_scheduler_batches",
+    )
 
 
 def _read_json_if_exists(path: Path) -> dict[str, Any]:
@@ -3009,12 +3033,7 @@ class InferenceEngine:
 
         scheduler = None
         previous_scheduler = getattr(self, "_last_scheduler", None)
-        if policy_bool(
-            self.model,
-            "MEGAGEMM_REUSE_REQUEST_SCHEDULER",
-            "reuse_request_scheduler",
-            default=False,
-        ):
+        if _request_scheduler_reuse_for_batch(self.model, len(prompts)):
             can_reuse = getattr(previous_scheduler, "can_reuse_for_request", None)
             reset_for_request = getattr(previous_scheduler, "reset_for_request", None)
             if callable(can_reuse) and callable(reset_for_request):
@@ -3186,12 +3205,7 @@ class InferenceEngine:
 
         scheduler = None
         previous_scheduler = getattr(self, "_last_scheduler", None)
-        if policy_bool(
-            self.model,
-            "MEGAGEMM_REUSE_REQUEST_SCHEDULER",
-            "reuse_request_scheduler",
-            default=False,
-        ):
+        if _request_scheduler_reuse_for_batch(self.model, len(prompts)):
             can_reuse = getattr(previous_scheduler, "can_reuse_for_request", None)
             reset_for_request = getattr(previous_scheduler, "reset_for_request", None)
             if callable(can_reuse) and callable(reset_for_request):

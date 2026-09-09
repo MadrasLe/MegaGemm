@@ -22,11 +22,18 @@ class RuntimePolicy:
     prefer_triton_rmsnorm: bool = False
     decode_prefer_step: bool = False
     reuse_request_scheduler: bool = False
+    reuse_request_scheduler_batches: tuple[int, ...] = ()
+    decode_cuda_graphs: bool = False
+    decode_cuda_graph_batches: tuple[int, ...] = ()
+    decode_cuda_graph_prefer_step: bool = False
+    decode_graph_multi_step_body: bool = False
+    decode_graph_persistent_token_feedback: bool = False
     paged_decode_splits: int = 0
     paged_decode_gqa2_direct: bool = False
     paged_decode_warps_h256: int = 0
     gemma4_dense_post_norm_chain: bool = False
     gemma4_e2b_h512_dense_bridge_pair: bool = False
+    gemma4_e2b_b1_dense_bridge: bool = False
     gemma4_ple_conditioned_gelu_decode: bool = False
     gemma4_e2b_l4_sliding_prefill: bool = False
     gemma4_e2b_l4_full_prefill_expand: bool = False
@@ -78,11 +85,18 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
             prefer_triton_rmsnorm=True,
             decode_prefer_step=False,
             reuse_request_scheduler=False,
+            reuse_request_scheduler_batches=(4,),
+            decode_cuda_graphs=True,
+            decode_cuda_graph_batches=(4,),
+            decode_cuda_graph_prefer_step=True,
+            decode_graph_multi_step_body=True,
+            decode_graph_persistent_token_feedback=True,
             paged_decode_splits=1,
             paged_decode_gqa2_direct=True,
             paged_decode_warps_h256=2,
             gemma4_dense_post_norm_chain=True,
             gemma4_e2b_h512_dense_bridge_pair=True,
+            gemma4_e2b_b1_dense_bridge=True,
             gemma4_e2b_l4_sliding_prefill=True,
             gemma4_e2b_l4_full_prefill_expand=True,
             gemma4_bf16_cublas_gateup_rows=(8,),
@@ -97,7 +111,7 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
                 "the MLP gate "
                 "retains cuBLAS for gate-up and down instead of the slower "
                 "fused gate-up and deepfusion MLP kernels, while "
-                "long sliding prefill uses independently measured B2, B4, "
+                "long sliding prefill uses independently measured B1, B2, B4, "
                 "and B8 Q8/KV1/H256/W512 Triton launch geometries; long full-H512 "
                 "prefill expands the single KV head once per layer and uses "
                 "implicit-causal SDPA. The exact-output B4/P2048 loaded-model "
@@ -105,7 +119,18 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
                 "2180.93 ms to 913.50 ms (2.387x), while the B8 dispatch "
                 "remains unchanged. The exact-output B2/P2048 gate independently "
                 "selected the same G2/BM16/BN64/W4/S2 geometry and reduced "
-                "prefill from 1078.41 ms to 447.18 ms (2.412x)"
+                "prefill from 1078.41 ms to 447.18 ms (2.412x). The exact-output "
+                "B1/P2048 gate selected G1/BM32/BN64/W4/S2 and reduced prefill "
+                "from 582.35 ms to 272.29 ms (2.139x). The paired B1/P2048 "
+                "decode gate promoted the dense attention-to-MLP bridge after "
+                "raising median decode from 32.94 to 36.79 tok/s (1.117x); "
+                "the exact-output B4/P2048/O128 execution gate promotes the "
+                "one-step CUDA Graph path after raising median decode from "
+                "122.01 to 141.39 tok/s (1.159x) and end-to-end throughput "
+                "from 98.05 to 110.72 tok/s (1.129x); the statistically tied "
+                "eight-step unrolled graph remains experimental; "
+                "the forced fused LM head and experimental large MLP paths "
+                "remain unpromoted"
             ),
         )
     if topology == (42, 2560, 8, 2):

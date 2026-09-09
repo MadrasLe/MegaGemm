@@ -81,6 +81,68 @@ def test_e2b_l4_h512_grouped_topology_is_exact_and_opt_in(monkeypatch):
     assert select(query, cache, tables, sliding_window=512) is None
 
 
+def test_e2b_l4_b1_h512_grouped_topology_has_independent_policy(monkeypatch):
+    monkeypatch.setattr(paged_attention, "_HAS_TRITON", True)
+    monkeypatch.setattr(
+        paged_attention,
+        "_cuda_device_info",
+        lambda _device=None: ((8, 9), "NVIDIA L4", 58),
+    )
+    monkeypatch.setattr(
+        paged_attention,
+        "_GROUPED_SEGMENTED_DECODE_DISABLED",
+        False,
+    )
+    monkeypatch.delenv(
+        "MEGAGEMM_GEMMA4_E2B_L4_B1_H512_GROUPED_ATTN_DECODE",
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "MEGAGEMM_GEMMA4_E2B_L4_H512_GROUPED_ATTN_DECODE",
+        "1",
+    )
+    query = _fake_cuda_tensor((1, 8, 512), 3)
+    cache = _fake_cuda_tensor((144, 2, 1, 16, 512), 5)
+    tables = _fake_cuda_tensor((1, 144), 2)
+    select = paged_attention._grouped_segmented_decode_topology
+
+    # The existing B8 switch must never activate the B1 shape.
+    assert select(query, cache, tables, sliding_window=None) is None
+    monkeypatch.setenv(
+        "MEGAGEMM_GEMMA4_E2B_L4_B1_H512_GROUPED_ATTN_DECODE",
+        "1",
+    )
+    assert (
+        select(query, cache, tables, sliding_window=None)
+        == "e2b_l4_b1_full_h512_gqa8"
+    )
+    assert select(query, cache, tables, sliding_window=512) is None
+
+
+def test_e2b_l4_b1_h512_launch_geometry_is_independent(monkeypatch):
+    topology = "e2b_l4_b1_full_h512_gqa8"
+    monkeypatch.delenv(
+        "MEGAGEMM_GEMMA4_E2B_L4_B1_H512_ATTN_SEGMENTS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "MEGAGEMM_GEMMA4_E2B_L4_B1_H512_ATTN_TILE",
+        raising=False,
+    )
+    assert paged_attention._grouped_segmented_decode_num_segments(topology, 2304) == 8
+    assert paged_attention._grouped_segmented_decode_tile_size(topology, 2304) == 16
+    monkeypatch.setenv(
+        "MEGAGEMM_GEMMA4_E2B_L4_B1_H512_ATTN_SEGMENTS",
+        "16",
+    )
+    monkeypatch.setenv(
+        "MEGAGEMM_GEMMA4_E2B_L4_B1_H512_ATTN_TILE",
+        "32",
+    )
+    assert paged_attention._grouped_segmented_decode_num_segments(topology, 2304) == 16
+    assert paged_attention._grouped_segmented_decode_tile_size(topology, 2304) == 32
+
+
 def test_e2b_l4_h512_segment_and_tile_candidates_are_overrideable(monkeypatch):
     topology = "e2b_l4_full_h512_gqa8"
     monkeypatch.delenv(
@@ -159,6 +221,16 @@ def test_e2b_candidate_gates_and_native_binding_are_present():
         / "benchmarks"
         / "run_gemma4_e2b_h512_bridge_full_model_colab.sh"
     ).read_text(encoding="utf-8")
+    b1_frontier_gate = (
+        ROOT
+        / "benchmarks"
+        / "run_gemma4_e2b_b1_decode_frontier_gate.py"
+    ).read_text(encoding="utf-8")
+    b1_frontier_colab = (
+        ROOT
+        / "benchmarks"
+        / "run_gemma4_e2b_b1_decode_frontier_colab.sh"
+    ).read_text(encoding="utf-8")
     binding = (ROOT / "pytorch_binding" / "binding.cpp").read_text(
         encoding="utf-8"
     )
@@ -179,6 +251,8 @@ def test_e2b_candidate_gates_and_native_binding_are_present():
     assert "cublasLtMatmulAlgoGetHeuristic" in native
     assert "MEGAGEMM_GEMMA4_E2B_CUBLASLT_GATEUP_DECODE" in llama
     assert "MEGAGEMM_GEMMA4_DENSE_ATTN_MLP_BRIDGE_DECODE" in llama
+    assert "MEGAGEMM_GEMMA4_E2B_L4_B1_DENSE_ATTN_MLP_BRIDGE_DECODE" in llama
+    assert '"gemma4_e2b_b1_dense_bridge"' in llama
     assert "timing_events is None\n                and not lw.is_moe" not in llama
     assert '"attn_mlp_bridge"' in llama
     assert "/content/drive/MyDrive/mg/MGRrmsnorm" in colab
@@ -207,3 +281,21 @@ def test_e2b_candidate_gates_and_native_binding_are_present():
     assert "pip install -q" in full_model_colab
     assert "pip install -q -e" not in full_model_colab
     assert "setup.py build_ext" not in full_model_colab
+    assert 'DecodeCase("core_factorial", "production")' in b1_frontier_gate
+    assert '"bridge_b1", bridge=True' in b1_frontier_gate
+    assert '"forced_fused_rms_lm_head"' in b1_frontier_gate
+    assert '"bridge_plus_fused_rms_lm_head"' in b1_frontier_gate
+    assert '"e2b_l4_b1_full_h512_gqa8"' in b1_frontier_gate
+    assert '"fused_large_gateup"' in b1_frontier_gate
+    assert '"deepfusion_large_down"' in b1_frontier_gate
+    assert '"model_loads": 1' in b1_frontier_gate
+    assert b1_frontier_gate.count("InferenceEngine(") == 1
+    assert "subprocess" not in b1_frontier_gate
+    assert "and int(out_features) == 24576" in llama
+    assert "and i_dim == 12288" in llama
+    assert "and h_dim == 1536" in llama
+    assert "_gemma4_flat_b1_large_gateup_hits" in llama
+    assert "_gemma4_flat_b1_large_down_hits" in llama
+    assert "git pull" not in b1_frontier_colab
+    assert "pip install -q -e" not in b1_frontier_colab
+    assert "/content/drive/MyDrive/mg/MGRrmsnorm" in b1_frontier_colab

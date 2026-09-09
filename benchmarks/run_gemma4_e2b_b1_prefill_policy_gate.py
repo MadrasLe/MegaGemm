@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Loaded-model B1/P2048 prefill policy gate for Gemma 4 E2B on L4.
 
-This runner reuses the full-model policy-gate implementation while installing
-a B1-only experimental configuration for the duration of the run. Production
-B2/B4/B8 dispatches are not changed by the benchmark.
+This runner reuses the full-model policy-gate implementation and can replay
+the B1 launch-geometry decision independently from the production default.
 """
 
 from __future__ import annotations
@@ -103,7 +102,7 @@ CASES: tuple[dict[str, Any], ...] = (
 _OVERRIDES = {
     "BATCH_SIZE": 1,
     "PROMPT_TOKENS": 2048,
-    "EXPERIMENT_FLAG": "MEGAGEMM_GEMMA4_E2B_L4_B1_PREFILL_EXPERIMENT",
+    "EXPERIMENT_FLAG": None,
     "TILE_PREFIX": "MEGAGEMM_GEMMA4_E2B_L4_B1_SLIDING_",
     "DISABLED_ATTR": "_GEMMA4_E2B_L4_B1_SLIDING_PREFILL_DISABLED",
     "BATCH_LABEL": "B1",

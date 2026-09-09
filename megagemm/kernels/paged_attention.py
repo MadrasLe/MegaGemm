@@ -481,29 +481,33 @@ def _grouped_segmented_decode_topology(
     window = int(sliding_window or 0)
     gqa_ratio = num_q_heads // num_kv_heads
 
-    # Experimental Gemma4 E2B/L4 full-attention path.  Keep the gate separate
-    # from the already-promoted A4B/A100 topology: E2B has half the batch and a
-    # single KV head, so copying the A100 policy blindly is not valid.  The
-    # checkpoint-free shape gate uses force=True; the loaded model opts in with
-    # the dedicated environment flag only after that gate has selected a
-    # segment/tile configuration.
+    # Experimental Gemma4 E2B/L4 full-attention paths.  B1 and B8 have separate
+    # opt-ins and launch geometry because their occupancy regimes are not
+    # interchangeable. ``force`` is reserved for checkpoint-free shape gates.
     if (
-        (
-            force
-            or _env_bool(
-                "MEGAGEMM_GEMMA4_E2B_L4_H512_GROUPED_ATTN_DECODE",
-                bool(e2b_l4_h512_policy_enabled),
-            )
-        )
-        and "l4" in device_tokens
-        and num_seqs == 8
+        "l4" in device_tokens
         and num_q_heads == 8
         and head_dim == 512
         and num_kv_heads == 1
         and gqa_ratio == 8
         and window == 0
     ):
-        return "e2b_l4_full_h512_gqa8"
+        if num_seqs == 1 and (
+            force
+            or _env_bool(
+                "MEGAGEMM_GEMMA4_E2B_L4_B1_H512_GROUPED_ATTN_DECODE",
+                False,
+            )
+        ):
+            return "e2b_l4_b1_full_h512_gqa8"
+        if num_seqs == 8 and (
+            force
+            or _env_bool(
+                "MEGAGEMM_GEMMA4_E2B_L4_H512_GROUPED_ATTN_DECODE",
+                bool(e2b_l4_h512_policy_enabled),
+            )
+        ):
+            return "e2b_l4_full_h512_gqa8"
 
     if "a100" not in device_tokens:
         return None
@@ -530,7 +534,12 @@ def _grouped_segmented_decode_num_segments(
     topology: str,
     max_visible_tokens: int,
 ) -> int:
-    """Select only A100 segment counts promoted by paid shape gates."""
+    """Select only segment counts scoped to their measured topology."""
+    if topology == "e2b_l4_b1_full_h512_gqa8":
+        return _env_int(
+            "MEGAGEMM_GEMMA4_E2B_L4_B1_H512_ATTN_SEGMENTS",
+            8,
+        )
     if topology == "e2b_l4_full_h512_gqa8":
         return _env_int(
             "MEGAGEMM_GEMMA4_E2B_L4_H512_ATTN_SEGMENTS",
@@ -547,7 +556,12 @@ def _grouped_segmented_decode_tile_size(
     topology: str,
     max_visible_tokens: int,
 ) -> int:
-    """Select only A100 tile sizes promoted by paid shape gates."""
+    """Select only tile sizes scoped to their measured topology."""
+    if topology == "e2b_l4_b1_full_h512_gqa8":
+        return _env_int(
+            "MEGAGEMM_GEMMA4_E2B_L4_B1_H512_ATTN_TILE",
+            16,
+        )
     if topology == "e2b_l4_full_h512_gqa8":
         return _env_int(
             "MEGAGEMM_GEMMA4_E2B_L4_H512_ATTN_TILE",
@@ -4464,12 +4478,10 @@ def gemma4_e2b_l4_sliding_prefill_attention(
     """Exact-shape production kernel for Gemma 4 E2B on NVIDIA L4.
 
     This path is deliberately narrower than the older A100/A4B long-prefill
-    kernels: BF16, B2/B4/B8, Q8/KV1, S2048..2304, H256, W512, and L4 only in
-    production. B1 is admitted only by its loaded-model tuning flag until a
-    launch geometry is promoted. Every production batch uses a loaded-model
-    measured launch geometry. The bounded sequence range includes the
-    chat-template tokens added to the publication workload. ``force`` exists
-    solely for tuning harnesses.
+    kernels: BF16, B1/B2/B4/B8, Q8/KV1, S2048..2304, H256, W512, and L4 only.
+    Every production batch uses a loaded-model measured launch geometry. The
+    bounded sequence range includes the chat-template tokens added to the
+    publication workload. ``force`` exists solely for tuning harnesses.
     """
     global _GEMMA4_E2B_L4_SLIDING_PREFILL_DISABLED
     global _GEMMA4_E2B_L4_B1_SLIDING_PREFILL_DISABLED
@@ -4491,16 +4503,6 @@ def gemma4_e2b_l4_sliding_prefill_attention(
         return None
 
     batch_size, num_q_heads, seq_len, head_dim = q.shape
-    b1_experimental = bool(
-        batch_size == 1
-        and (
-            force
-            or _env_bool(
-                "MEGAGEMM_GEMMA4_E2B_L4_B1_PREFILL_EXPERIMENT",
-                False,
-            )
-        )
-    )
     if (
         batch_size == 1
         and _GEMMA4_E2B_L4_B1_SLIDING_PREFILL_DISABLED
@@ -4524,7 +4526,7 @@ def gemma4_e2b_l4_sliding_prefill_attention(
     if tuple(v.shape) != tuple(k.shape):
         return None
     if (
-        (batch_size not in (2, 4, 8) and not b1_experimental)
+        batch_size not in (1, 2, 4, 8)
         or num_q_heads != 8
         or seq_len < 2048
         or seq_len > 2304
@@ -4539,7 +4541,7 @@ def gemma4_e2b_l4_sliding_prefill_attention(
 
     if batch_size == 1:
         env_prefix = "MEGAGEMM_GEMMA4_E2B_L4_B1_SLIDING_"
-        default_group_heads, default_block_m = 1, 8
+        default_group_heads, default_block_m = 1, 32
     elif batch_size == 2:
         env_prefix = "MEGAGEMM_GEMMA4_E2B_L4_B2_SLIDING_"
         default_group_heads, default_block_m = 2, 16

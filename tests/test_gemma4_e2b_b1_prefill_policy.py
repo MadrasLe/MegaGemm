@@ -17,20 +17,17 @@ def _load_module():
     return module
 
 
-def test_b1_candidate_is_experimental_and_production_batches_remain_scoped():
+def test_promoted_b1_is_long_shape_scoped_and_uses_measured_tile():
     paged = (ROOT / "megagemm" / "kernels" / "paged_attention.py").read_text(
         encoding="utf-8"
     )
     model = (ROOT / "megagemm" / "models" / "llama.py").read_text(
         encoding="utf-8"
     )
-    flag = "MEGAGEMM_GEMMA4_E2B_L4_B1_PREFILL_EXPERIMENT"
-    assert flag in paged
-    assert flag in model
-    assert "and not b1_experimental" in paged
+    assert "batch_size not in (1, 2, 4, 8)" in paged
     assert 'env_prefix = "MEGAGEMM_GEMMA4_E2B_L4_B1_SLIDING_"' in paged
-    assert "e2b_l4_full_batch in (2, 4, 8)" in model
-    assert "e2b_l4_full_batch == 1" in model
+    assert "default_group_heads, default_block_m = 1, 32" in paged
+    assert "e2b_l4_full_batch in (1, 2, 4, 8)" in model
     assert "block_rows not in (8, 16, 32, 64)" in paged
     assert "implicit_causal_prefill=(" in model
     assert "self.config.model_type == 'gemma4_text'" in model
@@ -51,7 +48,7 @@ def test_b1_gate_has_isolated_attribution_and_twelve_combined_tiles():
 def test_b1_summary_uses_b1_decisions_without_leaking_common_configuration():
     module = _load_module()
     common_batch = module.common.BATCH_SIZE
-    winner_name = "combined_g1_bm8_bn64_w4_s2"
+    winner_name = "combined_g1_bm32_bn64_w4_s2"
     samples = []
     for repeat in (1, 2, 3):
         for case in module.CASES:
@@ -79,7 +76,7 @@ def test_b1_summary_uses_b1_decisions_without_leaking_common_configuration():
     )
     assert result["decision"] == "IMPLEMENT_B1_POLICY_AND_RUN_TARGETED_MACRO_GATE"
     assert result["winner"] == winner_name
-    assert result["winner_config"] == (1, 8, 64, 4, 2)
+    assert result["winner_config"] == (1, 32, 64, 4, 2)
     assert module.common.BATCH_SIZE == common_batch
 
 
@@ -92,4 +89,5 @@ def test_b1_harness_is_drive_scoped_single_load_and_non_mutating():
     gate = SCRIPT.read_text(encoding="utf-8")
     assert gate.count("InferenceEngine(") == 0
     assert "common.run(args)" in gate
+    assert '"EXPERIMENT_FLAG": None' in gate
     assert "MEGAGEMM_BENCHMARK_FORCED_TOKEN_ID" not in gate

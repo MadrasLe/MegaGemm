@@ -987,7 +987,19 @@ def _gemma4_l4_e2b_decode_graph_shape(
         and len(layer_types) == 35
         and layer_types.count("sliding_attention") == 28
         and layer_types.count("full_attention") == 7
-        and int(num_seqs) == 8
+        and (
+            int(num_seqs) in (4, 8)
+            or (
+                int(num_seqs) in (1, 2, 4)
+                and os.environ.get(
+                    "MEGAGEMM_GEMMA4_E2B_SMALL_BATCH_GRAPH_EXPERIMENT", "0"
+                ) == "1"
+            )
+            or (
+                int(num_seqs) == 1
+                and os.environ.get("MEGAGEMM_GEMMA4_E2B_B1_GRAPH_EXPERIMENT", "0") == "1"
+            )
+        )
         and dtype == torch.bfloat16
         and str(device_type) == "cuda"
         and "L4" in str(device_name).upper()
@@ -4882,19 +4894,10 @@ class LlamaAttention(nn.Module):
         )
         if self.sliding_window <= 0:
             e2b_l4_full_batch = int(q.shape[0]) if q.ndim == 4 else 0
-            # Loaded-model gates independently validated B4 and B8 on L4.
-            # The remaining guards keep this promotion on the exact E2B BF16
-            # long-context topology and leave B1/B2 on their generic paths.
-            e2b_l4_full_batch_allowed = bool(
-                e2b_l4_full_batch in (2, 4, 8)
-                or (
-                    e2b_l4_full_batch == 1
-                    and _env_enabled(
-                        "MEGAGEMM_GEMMA4_E2B_L4_B1_PREFILL_EXPERIMENT",
-                        default=False,
-                    )
-                )
-            )
+            # Loaded-model gates independently validated B1/B2/B4/B8 on L4.
+            # The remaining guards keep the promotion on the exact E2B BF16
+            # long-context topology.
+            e2b_l4_full_batch_allowed = e2b_l4_full_batch in (1, 2, 4, 8)
             use_e2b_l4_expanded_full = bool(
                 implicit_causal
                 and self._gemma4_e2b_l4_full_prefill_expand_enabled
@@ -10836,6 +10839,7 @@ class MegaGemmLlama(nn.Module):
         self._fused_rmsnorm_lm_head_argmax_use = False
         self._fused_rmsnorm_lm_head_argmax_checked = False
         self._fused_rmsnorm_lm_head_argmax_disable = False
+        self._fused_rmsnorm_lm_head_argmax_hits = 0
         self._fused_rmsnorm_lm_head_argmax_error = ""
         self._fused_rmsnorm_lm_head_argmax_skip_reason = ""
         self._gemma4_batch_cublas_lm_head_hits = 0
@@ -10947,6 +10951,16 @@ class MegaGemmLlama(nn.Module):
         self._gemma4_flat_dense_attn_mlp_bridge_runtime_disabled = False
         self._gemma4_flat_dense_attn_mlp_bridge_failure = ""
         self._gemma4_flat_dense_attn_mlp_input_bufs = None
+        self._gemma4_flat_b1_large_gateup_experiment = _env_enabled(
+            "MEGAGEMM_GEMMA4_E2B_L4_B1_LARGE_GATEUP_EXPERIMENT",
+            default=False,
+        )
+        self._gemma4_flat_b1_large_down_experiment = _env_enabled(
+            "MEGAGEMM_GEMMA4_E2B_L4_B1_LARGE_DOWN_EXPERIMENT",
+            default=False,
+        )
+        self._gemma4_flat_b1_large_gateup_hits = 0
+        self._gemma4_flat_b1_large_down_hits = 0
         self._gemma4_flat_cublaslt_gateup_enabled = False
         self._gemma4_flat_cublaslt_gateup_hits = 0
         self._gemma4_flat_cublaslt_gateup_runtime_disabled = False
@@ -11793,6 +11807,7 @@ class MegaGemmLlama(nn.Module):
                         partial_vals=partial_vals,
                         partial_idxs=partial_idxs,
                     )
+                    self._fused_rmsnorm_lm_head_argmax_hits += 1
                     return next_tokens.view(hidden.shape[0])
                 except Exception as exc:
                     self._fused_rmsnorm_lm_head_argmax_error = f"{type(exc).__name__}: {exc}"
@@ -14219,6 +14234,45 @@ class MegaGemmLlama(nn.Module):
                     "",
                 )
             ),
+            "gemma4_e2b_b1_large_gateup_experiment": bool(
+                getattr(
+                    self,
+                    "_gemma4_flat_b1_large_gateup_experiment",
+                    False,
+                )
+            ),
+            "gemma4_e2b_b1_large_gateup_hits": int(
+                getattr(self, "_gemma4_flat_b1_large_gateup_hits", 0)
+            ),
+            "gemma4_e2b_b1_large_down_experiment": bool(
+                getattr(
+                    self,
+                    "_gemma4_flat_b1_large_down_experiment",
+                    False,
+                )
+            ),
+            "gemma4_e2b_b1_large_down_hits": int(
+                getattr(self, "_gemma4_flat_b1_large_down_hits", 0)
+            ),
+            "gemma4_b1_mlp_gemv_configs": dict(
+                getattr(self, "_gemma4_b1_mlp_gemv_configs", {})
+            ),
+            "gemma4_b1_mlp_gemv_dispatch": getattr(self, "_gemma4_b1_mlp_gemv_dispatch", "legacy"),
+            "gemma4_b1_mlp_prepared_gateup_hits": int(
+                getattr(self, "_gemma4_b1_mlp_prepared_hits", {}).get("gateup", 0)
+            ),
+            "gemma4_b1_mlp_prepared_down_hits": int(
+                getattr(self, "_gemma4_b1_mlp_prepared_hits", {}).get("down", 0)
+            ),
+            "gemma4_b1_mlp_gemv_failures": dict(
+                getattr(self, "_gemma4_b1_mlp_gemv_failures", {})
+            ),
+            "gemma4_b1_mlp_gemv_gateup_hits": int(
+                getattr(self, "_gemma4_b1_mlp_gemv_hits", {}).get("gateup", 0)
+            ),
+            "gemma4_b1_mlp_gemv_down_hits": int(
+                getattr(self, "_gemma4_b1_mlp_gemv_hits", {}).get("down", 0)
+            ),
             "gemma4_parallel_moe_decode_enabled": bool(
                 getattr(self, "_gemma4_flat_parallel_moe_enabled", False)
             ),
@@ -14407,6 +14461,9 @@ class MegaGemmLlama(nn.Module):
             ),
             "fused_rmsnorm_lm_head_argmax_use": bool(
                 getattr(self, "_fused_rmsnorm_lm_head_argmax_use", False)
+            ),
+            "fused_rmsnorm_lm_head_argmax_hits": int(
+                getattr(self, "_fused_rmsnorm_lm_head_argmax_hits", 0)
             ),
             "fused_rmsnorm_lm_head_argmax_disabled": bool(
                 getattr(self, "_fused_rmsnorm_lm_head_argmax_disable", False)
@@ -16349,11 +16406,30 @@ class MegaGemmLlama(nn.Module):
                 "gemma4_e2b_h512_dense_bridge_pair",
                 default=_GEMMA4_DENSE_ATTN_MLP_BRIDGE_DECODE,
             )
+            dense_attn_mlp_bridge_b1_experiment = _env_enabled(
+                "MEGAGEMM_GEMMA4_E2B_L4_B1_DECODE_FRONTIER_EXPERIMENT",
+                default=False,
+            )
+            dense_attn_mlp_bridge_b1_requested = policy_bool(
+                self,
+                "MEGAGEMM_GEMMA4_E2B_L4_B1_DENSE_ATTN_MLP_BRIDGE_DECODE",
+                "gemma4_e2b_b1_dense_bridge",
+                default=False,
+            )
             self._gemma4_flat_dense_attn_mlp_bridge_enabled = bool(
                 dense_attn_mlp_bridge_requested
                 and callable(rmsnorm_triton_attn_residual_dense)
                 and self.runtime_policy.name == "gemma4-e2b-l4"
-                and int(batch_size) == 8
+                and (
+                    int(batch_size) == 8
+                    or (
+                        int(batch_size) == 1
+                        and (
+                            dense_attn_mlp_bridge_b1_requested
+                            or dense_attn_mlp_bridge_b1_experiment
+                        )
+                    )
+                )
                 and dtype == torch.bfloat16
                 and not bool(self._flat_norm_offset)
                 and all(not lw.is_moe for lw in weights)
@@ -16802,6 +16878,18 @@ class MegaGemmLlama(nn.Module):
             return False
         out_features = 2 * lw.intermediate_size
         rows = int(hidden.shape[0]) if hidden.dim() == 2 else int(hidden.shape[0] * hidden.shape[1])
+        b1_large_gateup_experiment = bool(
+            getattr(
+                self,
+                "_gemma4_flat_b1_large_gateup_experiment",
+                False,
+            )
+            and self.runtime_policy.name == "gemma4-e2b-l4"
+            and hidden.dtype == torch.bfloat16
+            and rows == 1
+            and int(hidden.shape[-1]) == 1536
+            and int(out_features) == 24576
+        )
         policy_force_fused_gateup = bool(
             hidden.dtype == torch.bfloat16
             and rows
@@ -16820,7 +16908,9 @@ class MegaGemmLlama(nn.Module):
             )
             return False
         force_fused_gateup = bool(
-            _GEMMA4_FORCE_FUSED_GATEUP_USE or policy_force_fused_gateup
+            _GEMMA4_FORCE_FUSED_GATEUP_USE
+            or policy_force_fused_gateup
+            or b1_large_gateup_experiment
         )
         max_rows_override = rows if force_fused_gateup else None
         tuned_a4b = _gemma4_a100_a4b_tuned_mlp_shape(
@@ -16864,6 +16954,7 @@ class MegaGemmLlama(nn.Module):
             hidden.device.index,
             force_fused_gateup,
             policy_force_fused_gateup,
+            b1_large_gateup_experiment,
         )
         cache = self._gemma4_flat_fused_gateup_use_cache
         if key not in cache:
@@ -16967,11 +17058,25 @@ class MegaGemmLlama(nn.Module):
                 f"measured cuBLAS policy retained for BF16 rows={rows}",
             )
             return False
-        force_deepfusion = bool(
-            _GEMMA4_FORCE_DEEPFUSION_USE or policy_force_deepfusion
-        )
         i_dim = int(gate_up.shape[-1] // 2)
         h_dim = int(lw.down_weight.shape[0])
+        b1_large_down_experiment = bool(
+            getattr(
+                self,
+                "_gemma4_flat_b1_large_down_experiment",
+                False,
+            )
+            and self.runtime_policy.name == "gemma4-e2b-l4"
+            and gate_up.dtype == torch.bfloat16
+            and rows == 1
+            and i_dim == 12288
+            and h_dim == 1536
+        )
+        force_deepfusion = bool(
+            _GEMMA4_FORCE_DEEPFUSION_USE
+            or policy_force_deepfusion
+            or b1_large_down_experiment
+        )
         tuned_a4b = _gemma4_a100_a4b_tuned_mlp_shape(
             rows,
             h_dim,
@@ -17009,6 +17114,7 @@ class MegaGemmLlama(nn.Module):
             "gelu_tanh",
             force_deepfusion,
             policy_force_deepfusion,
+            b1_large_down_experiment,
         )
         cache = self._gemma4_flat_deepfusion_use_cache
         if key not in cache:
@@ -17063,6 +17169,129 @@ class MegaGemmLlama(nn.Module):
             _gemma4_log_mlp_fusion(self, "deepfusion", f"cached use={int(bool(cache[key]))} key={key[:4]}")
         return bool(cache[key])
 
+    @torch.inference_mode()
+    def _prepare_gemma4_b1_mlp_gemv_routes(self):
+        """Resolve exact-shape routes once, before the measured decode loop."""
+        from ..kernels.gemma4_b1_mlp_gemv import B1MlpGemvPlan
+
+        self._gemma4_b1_mlp_prepared_routes = None
+        configs = self._gemma4_b1_mlp_gemv_configs
+        if not configs:
+            return
+        if self.runtime_policy.name != "gemma4-e2b-l4":
+            raise ValueError("prepared B1 GEMV routes require the E2B/L4 policy")
+        large = [(i, lw) for i, lw in enumerate(self._flat_layer_weights)
+                 if not lw.is_moe and int(lw.intermediate_size) == 12288]
+        if len(large) != 20:
+            raise ValueError(f"prepared B1 GEMV requires 20 large layers, found {len(large)}")
+        plans = getattr(self, "_gemma4_b1_mlp_gemv_plans", {})
+        self._gemma4_b1_mlp_gemv_plans = plans
+        hits = getattr(self, "_gemma4_b1_mlp_gemv_hits", {})
+        self._gemma4_b1_mlp_gemv_hits = hits
+        prepared_hits = getattr(self, "_gemma4_b1_mlp_prepared_hits", {})
+        self._gemma4_b1_mlp_prepared_hits = prepared_hits
+        failures = self._gemma4_b1_mlp_gemv_failures
+
+        def audited(launch, operation):
+            def run(x):
+                if operation in failures:
+                    return None
+                try:
+                    result = launch(x)
+                except Exception as exc:
+                    failures[operation] = f"{type(exc).__name__}: {exc}"
+                    return None
+                hits[operation] = hits.get(operation, 0) + 1
+                prepared_hits[operation] = prepared_hits.get(operation, 0) + 1
+                return result
+            return run
+
+        routes = [(None, None) for _ in self._flat_layer_weights]
+        device = None
+        for index, lw in large:
+            bound = []
+            for operation in ("gateup", "down"):
+                config = configs.get(operation)
+                if not config:
+                    bound.append(None)
+                    continue
+                weight = lw.gate_up_weight if operation == "gateup" else lw.down_weight
+                bias = lw.gate_up_bias if operation == "gateup" else lw.down_bias
+                out = (self._gemma4_flat_gate_up_bufs if operation == "gateup"
+                       else self._gemma4_flat_down_bufs)[index]
+                if device is not None and weight.device != device:
+                    raise ValueError("prepared GEMV weights must share one CUDA device")
+                device = weight.device
+                key = (index, operation, config, id(weight), id(bias))
+                plan = plans.get(key)
+                if plan is None:
+                    plan = plans[key] = B1MlpGemvPlan(weight, bias, operation, config)
+                bound.append(audited(plan.bind_output(out), operation))
+            routes[index] = tuple(bound)
+        self._gemma4_b1_mlp_prepared_weights = self._flat_layer_weights
+        self._gemma4_b1_mlp_prepared_buffers = (
+            self._gemma4_flat_gate_up_bufs, self._gemma4_flat_down_bufs,
+        )
+        self._gemma4_b1_mlp_prepared_device = device
+        self._gemma4_b1_mlp_prepared_routes = routes
+
+    def _gemma4_b1_mlp_routes_for_decode(self, hidden):
+        """One boundary guard per token, outside the 35-layer loop."""
+        routes = self._gemma4_b1_mlp_prepared_routes
+        buffers = self._gemma4_b1_mlp_prepared_buffers
+        if (tuple(hidden.shape) != (1, 1536) or hidden.dtype != torch.bfloat16
+                or hidden.device != self._gemma4_b1_mlp_prepared_device
+                or not hidden.is_cuda or torch.is_grad_enabled()
+                or torch.cuda.current_device() != hidden.device.index
+                or self._flat_layer_weights is not self._gemma4_b1_mlp_prepared_weights
+                or self._gemma4_flat_gate_up_bufs is not buffers[0]
+                or self._gemma4_flat_down_bufs is not buffers[1]):
+            self._gemma4_b1_mlp_gemv_failures["boundary"] = "prepared GEMV shape/device/buffers changed"
+            return None
+        return routes
+
+    def _gemma4_b1_mlp_gemv_enabled(self, hidden, lw, operation):
+        configs = getattr(self, "_gemma4_b1_mlp_gemv_configs", {})
+        return bool(
+            configs.get(operation)
+            and self.runtime_policy.name == "gemma4-e2b-l4"
+            and hidden.is_cuda and hidden.dtype == torch.bfloat16
+            and not torch.is_grad_enabled()
+            and hidden.dim() == 2 and int(hidden.shape[0]) == 1
+            and int(hidden.shape[-1]) == 1536
+            and not lw.is_moe and int(lw.intermediate_size) == 12288
+        )
+
+    def _gemma4_b1_mlp_gemv(self, x, lw, layer_idx, operation, out):
+        """Explicit experimental route; failures remain visible to the gate."""
+        failures = getattr(self, "_gemma4_b1_mlp_gemv_failures", None)
+        if failures is None:
+            failures = self._gemma4_b1_mlp_gemv_failures = {}
+        if operation in failures:
+            return None
+        try:
+            config = self._gemma4_b1_mlp_gemv_configs[operation]
+            weight = lw.gate_up_weight if operation == "gateup" else lw.down_weight
+            bias = lw.gate_up_bias if operation == "gateup" else lw.down_bias
+            plans = getattr(self, "_gemma4_b1_mlp_gemv_plans", None)
+            if plans is None:
+                plans = self._gemma4_b1_mlp_gemv_plans = {}
+            key = (layer_idx, operation, config, id(weight), id(bias))
+            plan = plans.get(key)
+            if plan is None:
+                from ..kernels.gemma4_b1_mlp_gemv import B1MlpGemvPlan
+
+                plan = plans[key] = B1MlpGemvPlan(weight, bias, operation, config)
+            result = plan(x, out)
+        except Exception as exc:
+            failures[operation] = f"{type(exc).__name__}: {exc}"
+            return None
+        hits = getattr(self, "_gemma4_b1_mlp_gemv_hits", None)
+        if hits is None:
+            hits = self._gemma4_b1_mlp_gemv_hits = {}
+        hits[operation] = hits.get(operation, 0) + 1
+        return result
+
     def _gemma4_flat_shared_mlp_decode(
         self,
         hidden: torch.Tensor,
@@ -17071,13 +17300,21 @@ class MegaGemmLlama(nn.Module):
         timing_events: Optional[dict],
         *,
         normalized_input: Optional[torch.Tensor] = None,
+        gemv_routes: Optional[tuple] = None,
     ) -> torch.Tensor:
         """Run the dense shared FFN branch on the current CUDA stream."""
         norm_eps = self._flat_norm_eps
         int8_inline = getattr(self, '_flat_int8_inline', False)
+        b1_gemv_gateup = b1_gemv_down = False
+        if gemv_routes is not None:
+            b1_gemv_gateup, b1_gemv_down = gemv_routes
+        elif (getattr(self, "_gemma4_b1_mlp_gemv_configs", None)
+              and getattr(self, "_gemma4_b1_mlp_gemv_dispatch", "legacy") == "legacy"):
+            b1_gemv_gateup = self._gemma4_b1_mlp_gemv_enabled(hidden, lw, "gateup")
+            b1_gemv_down = self._gemma4_b1_mlp_gemv_enabled(hidden, lw, "down")
         mlp_gate_up_start_end = _timing_record_start(timing_events is not None)
         use_fused_gateup = bool(
-            normalized_input is None
+            not b1_gemv_gateup and normalized_input is None
             and self._gemma4_flat_should_use_fused_gateup(hidden, lw, layer_idx)
         )
         if use_fused_gateup:
@@ -17097,6 +17334,18 @@ class MegaGemmLlama(nn.Module):
                             "_gemma4_flat_policy_fused_gateup_rows",
                             (),
                         )
+                    )
+                    or (
+                        getattr(
+                            self,
+                            "_gemma4_flat_b1_large_gateup_experiment",
+                            False,
+                        )
+                        and self.runtime_policy.name == "gemma4-e2b-l4"
+                        and hidden.dtype == torch.bfloat16
+                        and rows == 1
+                        and int(hidden.shape[-1]) == 1536
+                        and int(2 * lw.intermediate_size) == 24576
                     )
                 )
                 gate_up = fused_rmsnorm_linear(
@@ -17118,6 +17367,19 @@ class MegaGemmLlama(nn.Module):
                 use_fused_gateup = False
             else:
                 self._gemma4_flat_fused_gateup_hits += 1
+                if (
+                    getattr(
+                        self,
+                        "_gemma4_flat_b1_large_gateup_experiment",
+                        False,
+                    )
+                    and self.runtime_policy.name == "gemma4-e2b-l4"
+                    and hidden.dtype == torch.bfloat16
+                    and rows == 1
+                    and int(hidden.shape[-1]) == 1536
+                    and int(2 * lw.intermediate_size) == 24576
+                ):
+                    self._gemma4_flat_b1_large_gateup_hits += 1
         if not use_fused_gateup:
             mlp_in = normalized_input
             if mlp_in is None:
@@ -17143,7 +17405,14 @@ class MegaGemmLlama(nn.Module):
                 in self._gemma4_flat_cublaslt_gateup_algorithms
             )
             gate_up = None
-            if use_cublaslt_gateup:
+            if gemv_routes is not None and b1_gemv_gateup:
+                gate_up = b1_gemv_gateup(mlp_in)
+            elif b1_gemv_gateup:
+                gate_up = self._gemma4_b1_mlp_gemv(
+                    mlp_in, lw, layer_idx, "gateup",
+                    self._gemma4_flat_gate_up_bufs[layer_idx],
+                )
+            if use_cublaslt_gateup and gate_up is None:
                 try:
                     gate_up = cublaslt_bf16_linear_cuda(
                         mlp_in,
@@ -17189,7 +17458,7 @@ class MegaGemmLlama(nn.Module):
         _timing_record_end(timing_events, "mlp_gate_up", mlp_gate_up_start_end)
 
         mlp_down_start_end = _timing_record_start(timing_events is not None)
-        use_deepfusion = self._gemma4_flat_should_use_deepfusion(
+        use_deepfusion = not b1_gemv_down and self._gemma4_flat_should_use_deepfusion(
             gate_up, lw, layer_idx
         )
         if use_deepfusion:
@@ -17209,6 +17478,19 @@ class MegaGemmLlama(nn.Module):
                 use_deepfusion = False
             else:
                 self._gemma4_flat_deepfusion_hits += 1
+                if (
+                    getattr(
+                        self,
+                        "_gemma4_flat_b1_large_down_experiment",
+                        False,
+                    )
+                    and self.runtime_policy.name == "gemma4-e2b-l4"
+                    and gate_up.dtype == torch.bfloat16
+                    and int(gate_up.shape[0]) == 1
+                    and int(gate_up.shape[-1]) == 24576
+                    and int(lw.down_weight.shape[0]) == 1536
+                ):
+                    self._gemma4_flat_b1_large_down_hits += 1
         if not use_deepfusion:
             gate = gate_up[:, :lw.intermediate_size]
             value = gate_up[:, lw.intermediate_size:]
@@ -17216,7 +17498,17 @@ class MegaGemmLlama(nn.Module):
             activated = torch.nn.functional.gelu(gate, approximate='tanh')
             activated.mul_(value)
             _timing_record_end(timing_events, "mlp_act", mlp_act_start_end)
-            if lw.down_wt is not None:
+            down_out = None
+            if gemv_routes is not None and b1_gemv_down:
+                down_out = b1_gemv_down(activated)
+            elif b1_gemv_down:
+                down_out = self._gemma4_b1_mlp_gemv(
+                    activated, lw, layer_idx, "down",
+                    self._gemma4_flat_down_bufs[layer_idx],
+                )
+            if down_out is not None:
+                pass
+            elif lw.down_wt is not None:
                 down_out = self._flat_fp_linear(
                     activated,
                     lw.down_wt,
@@ -17253,6 +17545,9 @@ class MegaGemmLlama(nn.Module):
     ) -> torch.Tensor:
         bsz = hidden.shape[0]
         hidden = hidden.reshape(bsz, -1)
+        prepared_gemv_routes = None
+        if getattr(self, "_gemma4_b1_mlp_prepared_routes", None) is not None:
+            prepared_gemv_routes = self._gemma4_b1_mlp_routes_for_decode(hidden)
         pos_ids = pos_1d.reshape(bsz, 1)
         norm_eps = self._flat_norm_eps
         norm_offset = self._flat_norm_offset
@@ -17625,7 +17920,7 @@ class MegaGemmLlama(nn.Module):
                 self._gemma4_flat_fused_attn_moe_bridge_hits += 1
             elif (
                 not lw.is_moe
-                and int(bsz) == 8
+                and int(bsz) in (1, 8)
                 and self._gemma4_flat_dense_attn_mlp_bridge_enabled
                 and not self._gemma4_flat_dense_attn_mlp_bridge_runtime_disabled
             ):
@@ -17802,6 +18097,8 @@ class MegaGemmLlama(nn.Module):
                     layer_idx,
                     timing_events,
                     normalized_input=bridge_dense_in,
+                    gemv_routes=(prepared_gemv_routes[layer_idx]
+                                 if prepared_gemv_routes is not None else None),
                 )
             if lw.is_moe:
                 mlp_output_norm_start_end = _timing_record_start(timing_events is not None)
@@ -18896,7 +19193,7 @@ class MegaGemmLlama(nn.Module):
         stride = logit_lens if isinstance(logit_lens, int) and logit_lens > 1 else 1
         layer_kv_caches = [block_manager.get_kv_cache(layer_idx) for layer_idx in range(num_layers)]
 
-        # ── Flat decode path (zero Python overhead) ──
+        # Flat decode avoids per-layer Module dispatch, not all Python execution.
         if not self._flat_decode_ready and not self._flat_decode_failed:
             self._prepare_flat_decode()
         if (
@@ -19220,7 +19517,7 @@ class MegaGemmLlama(nn.Module):
                 )
             decode_body_start_end = _timing_record_start(timing_events is not None)
 
-            # ── Flat decode path (zero Python overhead) ──
+            # Flat decode avoids per-layer Module dispatch, not all Python execution.
             if (
                 self._flat_decode_ready
                 and offloader is None

@@ -30,7 +30,7 @@ def test_e2b_l4_candidate_rejects_non_cuda_without_allocating_output():
     ) is None
 
 
-def test_e2b_l4_kernel_keeps_b4_and_b8_production_dispatches_exact():
+def test_e2b_l4_kernel_keeps_batch_specific_production_dispatches_exact():
     kernel = KERNEL.read_text(encoding="utf-8")
     model = MODEL.read_text(encoding="utf-8")
 
@@ -38,7 +38,7 @@ def test_e2b_l4_kernel_keeps_b4_and_b8_production_dispatches_exact():
         "def _gemma4_e2b_l4_sliding_prefill_kernel(",
         "def gemma4_e2b_l4_sliding_prefill_attention(",
         "tuple(k.shape) != (batch_size, 1, seq_len, 256)",
-        'batch_size not in (2, 4, 8)',
+        'batch_size not in (1, 2, 4, 8)',
         "num_q_heads != 8",
         "seq_len < 2048",
         "seq_len > 2304",
@@ -50,6 +50,7 @@ def test_e2b_l4_kernel_keeps_b4_and_b8_production_dispatches_exact():
         '"MEGAGEMM_GEMMA4_E2B_L4_SLIDING_"',
         'default_group_heads, default_block_m = 2, 16',
         'default_group_heads, default_block_m = 4, 8',
+        'default_group_heads, default_block_m = 1, 32',
         'env_prefix + "GROUP_HEADS", default_group_heads',
         'env_prefix + "BLOCK_M", default_block_m',
         'env_prefix + "NUM_WARPS", 4',

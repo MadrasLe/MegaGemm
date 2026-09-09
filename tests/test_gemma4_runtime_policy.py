@@ -24,11 +24,18 @@ def test_e2b_l4_policy_preserves_measured_multi_step_triton_path():
     assert policy.prefer_triton_rmsnorm is True
     assert policy.decode_prefer_step is False
     assert policy.reuse_request_scheduler is False
+    assert policy.reuse_request_scheduler_batches == (4,)
+    assert policy.decode_cuda_graphs is True
+    assert policy.decode_cuda_graph_batches == (4,)
+    assert policy.decode_cuda_graph_prefer_step is True
+    assert policy.decode_graph_multi_step_body is True
+    assert policy.decode_graph_persistent_token_feedback is True
     assert policy.paged_decode_splits == 1
     assert policy.paged_decode_gqa2_direct is True
     assert policy.paged_decode_warps_h256 == 2
     assert policy.gemma4_dense_post_norm_chain is True
     assert policy.gemma4_e2b_h512_dense_bridge_pair is True
+    assert policy.gemma4_e2b_b1_dense_bridge is True
     assert policy.gemma4_ple_conditioned_gelu_decode is False
     assert policy.gemma4_e2b_l4_sliding_prefill is True
     assert policy.gemma4_e2b_l4_full_prefill_expand is True
@@ -45,11 +52,18 @@ def test_e4b_l4_policy_preserves_measured_step_and_reuse_path():
     assert policy.prefer_triton_rmsnorm is False
     assert policy.decode_prefer_step is True
     assert policy.reuse_request_scheduler is True
+    assert policy.reuse_request_scheduler_batches == ()
+    assert policy.decode_cuda_graphs is False
+    assert policy.decode_cuda_graph_batches == ()
+    assert policy.decode_cuda_graph_prefer_step is False
+    assert policy.decode_graph_multi_step_body is False
+    assert policy.decode_graph_persistent_token_feedback is False
     assert policy.paged_decode_splits == 0
     assert policy.paged_decode_gqa2_direct is False
     assert policy.paged_decode_warps_h256 == 0
     assert policy.gemma4_dense_post_norm_chain is False
     assert policy.gemma4_e2b_h512_dense_bridge_pair is False
+    assert policy.gemma4_e2b_b1_dense_bridge is False
     assert policy.gemma4_ple_conditioned_gelu_decode is False
     assert policy.gemma4_e2b_l4_sliding_prefill is False
     assert policy.gemma4_e2b_l4_full_prefill_expand is False
@@ -65,11 +79,18 @@ def test_gemma4_policy_is_not_promoted_to_unmeasured_hardware():
     assert policy.name == "gemma4-generic"
     assert policy.decode_prefer_step is False
     assert policy.reuse_request_scheduler is False
+    assert policy.reuse_request_scheduler_batches == ()
+    assert policy.decode_cuda_graphs is False
+    assert policy.decode_cuda_graph_batches == ()
+    assert policy.decode_cuda_graph_prefer_step is False
+    assert policy.decode_graph_multi_step_body is False
+    assert policy.decode_graph_persistent_token_feedback is False
     assert policy.paged_decode_splits == 0
     assert policy.paged_decode_gqa2_direct is False
     assert policy.paged_decode_warps_h256 == 0
     assert policy.gemma4_dense_post_norm_chain is False
     assert policy.gemma4_e2b_h512_dense_bridge_pair is False
+    assert policy.gemma4_e2b_b1_dense_bridge is False
     assert policy.gemma4_ple_conditioned_gelu_decode is False
     assert policy.gemma4_e2b_l4_sliding_prefill is False
     assert policy.gemma4_e2b_l4_full_prefill_expand is False
@@ -98,6 +119,57 @@ def test_explicit_environment_flag_overrides_model_policy(monkeypatch):
         "MEGAGEMM_DECODE_PREFER_STEP",
         "decode_prefer_step",
     ) is False
+
+
+def test_e2b_b4_graph_policy_is_batch_scoped_and_env_overridable(monkeypatch):
+    model = SimpleNamespace(
+        runtime_policy=resolve_runtime_policy(
+            _config(35, 1536, 8, 1), "NVIDIA L4"
+        )
+    )
+
+    assert policy_bool(
+        model,
+        "MEGAGEMM_DECODE_CUDA_GRAPHS",
+        "decode_cuda_graphs",
+    ) is True
+    assert policy_rows(
+        model,
+        "MEGAGEMM_DECODE_CUDA_GRAPHS",
+        "decode_cuda_graph_batches",
+    ) == (4,)
+
+    monkeypatch.setenv("MEGAGEMM_DECODE_CUDA_GRAPHS", "0")
+    assert policy_bool(
+        model,
+        "MEGAGEMM_DECODE_CUDA_GRAPHS",
+        "decode_cuda_graphs",
+    ) is False
+    assert policy_rows(
+        model,
+        "MEGAGEMM_DECODE_CUDA_GRAPHS",
+        "decode_cuda_graph_batches",
+    ) == ()
+
+
+def test_e2b_request_scheduler_reuse_is_only_promoted_for_b4(monkeypatch):
+    from megagemm.engine.engine import _request_scheduler_reuse_for_batch
+
+    model = SimpleNamespace(
+        runtime_policy=resolve_runtime_policy(
+            _config(35, 1536, 8, 1), "NVIDIA L4"
+        )
+    )
+
+    assert not _request_scheduler_reuse_for_batch(model, 1)
+    assert not _request_scheduler_reuse_for_batch(model, 2)
+    assert _request_scheduler_reuse_for_batch(model, 4)
+    assert not _request_scheduler_reuse_for_batch(model, 8)
+
+    monkeypatch.setenv("MEGAGEMM_REUSE_REQUEST_SCHEDULER", "1")
+    assert _request_scheduler_reuse_for_batch(model, 1)
+    monkeypatch.setenv("MEGAGEMM_REUSE_REQUEST_SCHEDULER", "0")
+    assert not _request_scheduler_reuse_for_batch(model, 4)
 
 
 def test_explicit_environment_can_disable_promoted_e2b_dense_chain(monkeypatch):

@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Callable, Sequence, Union
 
 from .kv_cache import BlockManager
 from .sampling import sample_logits
-from ..models.runtime_policy import policy_bool
+from ..models.runtime_policy import policy_bool, policy_rows
 
 try:
     import megagemm_decode_ops as _decode_native_ops
@@ -231,12 +231,17 @@ class Scheduler:
         self.device = device
         self._prefill_capture_hook = prefill_capture_hook
         self._materialize_generated_tokens = bool(materialize_generated_tokens)
+        reuse_batches = policy_rows(
+            model,
+            "MEGAGEMM_REUSE_REQUEST_SCHEDULER",
+            "reuse_request_scheduler_batches",
+        )
         self._request_scheduler_reuse_enabled = policy_bool(
             model,
             "MEGAGEMM_REUSE_REQUEST_SCHEDULER",
             "reuse_request_scheduler",
             default=False,
-        )
+        ) or bool(reuse_batches)
         self._request_scheduler_env_signature = _request_scheduler_env_signature()
         self._request_scheduler_reused = False
         self._request_scheduler_reuse_count = 0
@@ -258,8 +263,10 @@ class Scheduler:
         self._decode_graph_token_burst = _env_bool(
             "MEGAGEMM_DECODE_GRAPH_TOKEN_BURST", default=True,
         )
-        self._decode_graph_persistent_token_feedback = _env_bool(
+        self._decode_graph_persistent_token_feedback = policy_bool(
+            model,
             "MEGAGEMM_DECODE_GRAPH_PERSISTENT_TOKEN_FEEDBACK",
+            "decode_graph_persistent_token_feedback",
             default=False,
         )
         self._decode_native_graph_burst = bool(
@@ -270,6 +277,17 @@ class Scheduler:
         self._decode_unrolled_graph_burst = _env_bool(
             "MEGAGEMM_DECODE_UNROLLED_GRAPH_BURST",
             default=False,
+        )
+        # CUDA-graph execution keeps the production multi-step model body,
+        # including its LM-head policy. Runtime policy can scope it by batch.
+        self._decode_graph_multi_step_body = policy_bool(
+            model,
+            "MEGAGEMM_DECODE_GRAPH_MULTI_STEP_BODY",
+            "decode_graph_multi_step_body",
+            default=False,
+        )
+        self._decode_graph_eager_control = _env_bool(
+            "MEGAGEMM_DECODE_GRAPH_EAGER_CONTROL", default=False,
         )
         self._benchmark_forced_token_id = _env_int(
             "MEGAGEMM_BENCHMARK_FORCED_TOKEN_ID", -1
@@ -391,11 +409,21 @@ class Scheduler:
         # Optional decode CUDA Graphs.
         # Kept conservative on purpose: one stable graph per active batch
         # membership, invalidated as soon as the running set changes.
-        self._decode_cuda_graphs = _env_bool(
-            "MEGAGEMM_DECODE_CUDA_GRAPHS", default=False,
+        self._decode_cuda_graph_policy_batches = policy_rows(
+            model,
+            "MEGAGEMM_DECODE_CUDA_GRAPHS",
+            "decode_cuda_graph_batches",
         )
-        self._decode_cuda_graph_prefer_step = _env_bool(
+        self._decode_cuda_graphs = policy_bool(
+            model,
+            "MEGAGEMM_DECODE_CUDA_GRAPHS",
+            "decode_cuda_graphs",
+            default=False,
+        )
+        self._decode_cuda_graph_prefer_step = policy_bool(
+            model,
             "MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP",
+            "decode_cuda_graph_prefer_step",
             default=False,
         )
         self._decode_cuda_graph_shape_cache = _env_bool(
@@ -704,6 +732,7 @@ class Scheduler:
             prefer_graph_step = (
                 self._decode_cuda_graphs
                 and self._decode_cuda_graph_prefer_step
+                and self._decode_graph_batch_allowed(len(requests))
             )
             prefer_decode_step = self._decode_prefer_step or prefer_graph_step
             use_graph_token_burst = bool(
@@ -1980,8 +2009,14 @@ class Scheduler:
         self._decode_graph_failed_key = None
         self._decode_graph_chain_started_keys.clear()
 
+    def _decode_graph_batch_allowed(self, batch_size: int) -> bool:
+        policy_batches = getattr(self, "_decode_cuda_graph_policy_batches", ())
+        return not policy_batches or int(batch_size) in policy_batches
+
     def _decode_graph_is_eligible(self, seq_ids: List[int]) -> bool:
         if not self._decode_cuda_graphs:
+            return False
+        if not self._decode_graph_batch_allowed(len(seq_ids)):
             return False
         if self.device != 'cuda' or not torch.cuda.is_available():
             return False
@@ -2180,6 +2215,22 @@ class Scheduler:
         positions.copy_(buf_pos)
         return input_ids, positions
 
+    def _decode_graph_model_step(
+        self, input_ids, positions, seq_ids, return_next_token=False,
+    ):
+        if getattr(self, "_decode_graph_multi_step_body", False):
+            if not return_next_token:
+                raise RuntimeError("multi-step graph body requires greedy token output")
+            tokens, _ = self.model.decode_multi_step(
+                input_ids, positions, self.block_manager, seq_ids,
+                num_steps=1, return_final_logits=False, return_token_ids=True,
+            )
+            return tokens.reshape(len(seq_ids))
+        return self.model.decode_step(
+            input_ids, positions, self.block_manager, seq_ids,
+            return_next_token=return_next_token,
+        )
+
     def _run_decode_with_metadata_override(
         self,
         state: dict,
@@ -2204,11 +2255,8 @@ class Scheduler:
             int(state.get("max_decode_blocks") or state["block_table"].shape[1]),
         )
         try:
-            logits = self.model.decode_step(
-                input_ids,
-                positions,
-                self.block_manager,
-                seq_ids,
+            logits = self._decode_graph_model_step(
+                input_ids, positions, seq_ids,
                 return_next_token=return_next_token,
             )
             self._mark_decode_graph_shape_state_synced(state, seq_ids)
@@ -2232,6 +2280,9 @@ class Scheduler:
         clearer = getattr(self.block_manager, "clear_decode_metadata_override")
         input_ids = buf_ids
         positions = buf_pos
+        python_seq_lens_before = {
+            int(sid): int(self.block_manager.seq_lens[int(sid)]) for sid in seq_ids
+        }
         setter(
             state["block_table"],
             state["seq_lens"],
@@ -2239,13 +2290,17 @@ class Scheduler:
         )
         try:
             with torch.cuda.graph(graph):
-                logits = self.model.decode_step(
-                    input_ids, positions, self.block_manager, seq_ids,
+                logits = self._decode_graph_model_step(
+                    input_ids, positions, seq_ids,
                     return_next_token=return_next_token,
                 )
                 if chain_graph_inputs:
                     input_ids.copy_(logits.reshape_as(input_ids))
                     positions.add_(1)
+        except Exception:
+            for sid, length in python_seq_lens_before.items():
+                self.block_manager.seq_lens[sid] = length
+            raise
         finally:
             clearer()
         state["graph"] = graph
@@ -2287,7 +2342,7 @@ class Scheduler:
             graph_positions = state.get("positions")
         persistent_replay = bool(
             chain_graph_inputs
-            and state.get("graph") is not None
+            and (state.get("graph") is not None or state.get("eager_control", False))
             and key in self._decode_graph_chain_started_keys
             and state.get("seq_key") == tuple(int(sid) for sid in seq_ids)
             and graph_input_ids is not None
@@ -2301,6 +2356,21 @@ class Scheduler:
                 state, buf_ids, buf_pos
             )
         self._decode_graph_last_feedback_persistent = False
+        if self._decode_graph_eager_control:
+            if not self._decode_graph_multi_step_body or not chain_graph_inputs:
+                raise RuntimeError(
+                    "eager graph control requires the multi-step token-feedback body"
+                )
+            result = self._run_decode_with_metadata_override(
+                state, seq_ids, input_ids, positions, return_next_token=True,
+            )
+            input_ids.copy_(result.reshape_as(input_ids))
+            positions.add_(1)
+            state.update(eager_control=True, graph_input_ids=input_ids, graph_positions=positions)
+            self._decode_graph_chain_started_keys.add(key)
+            self._decode_graph_last_feedback_persistent = True
+            self._decode_graph_persistent_feedback_steps += 1
+            return result
         if key in self._decode_graph_shape_failed_keys:
             return self._run_decode_with_metadata_override(
                 state,
@@ -2359,6 +2429,12 @@ class Scheduler:
                 frame = stack[-1]
                 tb = f"{tb} at {frame.filename}:{frame.lineno} in {frame.name}"
             self._decode_graph_last_failure = tb
+            if self._decode_graph_multi_step_body:
+                # Experimental A/B must stop on capture failure, not execute
+                # an eager fallback against partially captured mutable state.
+                raise RuntimeError(
+                    f"multi-step decode graph capture failed: {tb}"
+                ) from exc
             self._log_decode_graph(
                 f"capture failed for shape batch={key[0]} table_blocks={key[1]} "
                 f"loop_blocks={key[2]}: {tb}; "
@@ -2489,7 +2565,7 @@ class Scheduler:
         state = self._decode_graph_shape_states.get(key)
         if (
             state is None
-            or state.get("graph") is None
+            or (state.get("graph") is None and not state.get("eager_control", False))
             or key not in self._decode_graph_chain_started_keys
             or state.get("seq_key") != tuple(int(sid) for sid in seq_ids)
         ):
@@ -2571,11 +2647,8 @@ class Scheduler:
             torch.cuda.synchronize()
             with torch.cuda.graph(graph):
                 for step in range(int(num_steps)):
-                    next_tokens = self.model.decode_step(
-                        input_ids,
-                        positions,
-                        self.block_manager,
-                        seq_ids,
+                    next_tokens = self._decode_graph_model_step(
+                        input_ids, positions, seq_ids,
                         return_next_token=True,
                     ).reshape(len(seq_ids))
                     output_tokens[:, step].copy_(next_tokens)
@@ -3120,6 +3193,8 @@ class Scheduler:
         ):
             stats['decode_cuda_graphs'] = {
                 'enabled': bool(self._decode_cuda_graphs),
+                'multi_step_body': bool(self._decode_graph_multi_step_body),
+                'eager_control': bool(self._decode_graph_eager_control),
                 'prefer_step': bool(self._decode_cuda_graph_prefer_step),
                 'token_burst_enabled': bool(self._decode_graph_token_burst),
                 'token_burst_size': int(self._decode_multi_step_burst),
