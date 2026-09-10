@@ -52,8 +52,6 @@ VARIANTS = {
 # caused a severe E2B regression that a structural-only audit failed to catch.
 GEMMA4_DENSE_COMMON_PROFILE = {
     "MEGAGEMM_FLAT_DECODE": "1",
-    "MEGAGEMM_DECODE_CUDA_GRAPHS": "0",
-    "MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP": "0",
     "MEGAGEMM_FUSED_ROPE_ATTN": "1",
     "MEGAGEMM_FAST_GEMV": "1",
     "MEGAGEMM_DEEPFUSION_MLP": "1",
@@ -72,19 +70,20 @@ GEMMA4_DENSE_COMMON_PROFILE = {
 }
 
 
-# Preserve E2B's measured L4 path: multi-step eager decode, Triton RMSNorm,
-# and request-local schedulers.  The shared E4B settings are not safe here.
+# Preserve E2B's measured L4 paths. Scheduler/graph selection intentionally
+# comes from RuntimePolicy because it is batch-scoped: B4 uses the promoted
+# one-step CUDA Graph, while B1/B2/B8 keep their independently measured paths.
 GEMMA4_E2B_FAST_PROFILE = {
     **GEMMA4_DENSE_COMMON_PROFILE,
     "MEGAGEMM_DISABLE_CUDA_RMSNORM": "1",
-    "MEGAGEMM_DECODE_PREFER_STEP": "0",
-    "MEGAGEMM_REUSE_REQUEST_SCHEDULER": "0",
 }
 
 
 # E4B benefits from the native CUDA RMSNorm and one-token scheduler route.
 GEMMA4_E4B_FAST_PROFILE = {
     **GEMMA4_DENSE_COMMON_PROFILE,
+    "MEGAGEMM_DECODE_CUDA_GRAPHS": "0",
+    "MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP": "0",
     "MEGAGEMM_DISABLE_CUDA_RMSNORM": "0",
     "MEGAGEMM_DECODE_PREFER_STEP": "1",
     "MEGAGEMM_REUSE_REQUEST_SCHEDULER": "1",
@@ -103,6 +102,8 @@ GEMMA4_PROFILE_REQUIREMENTS = {
         "model_marker": "e2b",
         "prefer_step": False,
         "reuse_scheduler": False,
+        "decode_cuda_graph_batches": (4,),
+        "reuse_scheduler_batches": (4,),
         "require_dense_post_norm_chain": True,
         "require_e2b_h512_dense_bridge_pair": True,
         "require_bf16_batch8_cublas_mlp": True,
@@ -132,6 +133,8 @@ GEMMA4_PROFILE_REQUIREMENTS = {
         "model_marker": "e4b",
         "prefer_step": True,
         "reuse_scheduler": True,
+        "decode_cuda_graph_batches": (),
+        "reuse_scheduler_batches": (),
         "require_dense_post_norm_chain": False,
         "require_bf16_batch8_cublas_mlp": False,
         "require_e2b_l4_sliding_prefill": False,
@@ -185,23 +188,14 @@ def child_environment(
     env = os.environ.copy()
     if variant.backend == "megagemm":
         if profile in GEMMA4_PROFILE_REQUIREMENTS:
+            # A publication profile is a clean environment, not a partial
+            # overlay on arbitrary notebook experiments.
+            for key in tuple(env):
+                if key.startswith("MEGAGEMM_"):
+                    env.pop(key, None)
             # Deterministic cuBLAS workspaces were copied from a separate A100
             # validation harness and are not part of the dense L4 speed path.
             env.pop("CUBLAS_WORKSPACE_CONFIG", None)
-            # Publication profiles must exercise the measured model policy,
-            # not force flags inherited from an earlier notebook experiment.
-            env.pop("MEGAGEMM_GEMMA4_FORCE_FUSED_GATEUP_USE", None)
-            env.pop("MEGAGEMM_GEMMA4_FORCE_DEEPFUSION_USE", None)
-            env.pop(
-                "MEGAGEMM_GEMMA4_E2B_L4_H512_GROUPED_ATTN_DECODE",
-                None,
-            )
-            env.pop("MEGAGEMM_GEMMA4_E2B_L4_H512_ATTN_SEGMENTS", None)
-            env.pop("MEGAGEMM_GEMMA4_E2B_L4_H512_ATTN_TILE", None)
-            env.pop("MEGAGEMM_GEMMA4_GROUPED_SEGMENTED_ATTN_WARPS", None)
-            env.pop("MEGAGEMM_GEMMA4_GROUPED_SEGMENTED_ATTN_STAGES", None)
-            env.pop("MEGAGEMM_GEMMA4_GROUPED_SEGMENTED_ATTN_REDUCE_WARPS", None)
-            env.pop("MEGAGEMM_GEMMA4_DENSE_ATTN_MLP_BRIDGE_DECODE", None)
         env.update(profile_environment(profile, model))
     return env
 
@@ -460,6 +454,17 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
     ]
     prefer_step = bool(requirement["prefer_step"])
     expected_reuse = bool(requirement["reuse_scheduler"])
+    expected_graph_batches = tuple(
+        int(value) for value in requirement.get("decode_cuda_graph_batches", ())
+    )
+    expected_reuse_batches = tuple(
+        int(value) for value in requirement.get("reuse_scheduler_batches", ())
+    )
+    successful_batches = {
+        int(row.get("batch_size", 0) or 0) for row in successful
+    }
+    graph_batches_present = successful_batches.intersection(expected_graph_batches)
+    reuse_batches_present = successful_batches.intersection(expected_reuse_batches)
 
     errors: list[str] = []
     if failed:
@@ -509,20 +514,60 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
         errors.append(f"flat decode not ready: {', '.join(reasons)}")
     if decode_stats and any(item.get("flat_decode_failed") for item in decode_stats):
         errors.append("flat decode reported a runtime failure")
-    # E2B disables both graphs and scheduler reuse, so Scheduler historically
-    # omitted this all-zero diagnostics block.  E4B enables reuse and must emit
-    # it.  Newer schedulers emit the block unconditionally for explicit proof.
-    if expected_reuse and len(graph_stats) != len(successful):
+    # Graph/reuse can be global (E4B reuse) or batch-scoped (E2B B4 graph).
+    # Only rows for a promoted batch may capture or replay a graph.
+    if (expected_reuse or graph_batches_present or reuse_batches_present) and len(
+        graph_stats
+    ) != len(successful):
         errors.append("decode_cuda_graphs stats missing from one or more rows")
-    if graph_stats and any(item.get("enabled") for item in graph_stats):
-        errors.append("decode CUDA Graphs were unexpectedly enabled")
     graph_replays = _max_counter(graph_stats, "replays")
     graph_captures = _max_counter(graph_stats, "captures")
     graph_failures = _max_counter(graph_stats, "failures")
-    if graph_captures > 0 or graph_replays > 0:
-        errors.append(
-            "decode CUDA Graphs captured or replayed in the eager-only profile"
-        )
+    for row in successful:
+        scheduler = row.get("scheduler_stats")
+        if not isinstance(scheduler, dict):
+            continue
+        batch_size = int(row.get("batch_size", 0) or 0)
+        graph = scheduler.get("decode_cuda_graphs")
+        if not isinstance(graph, dict):
+            continue
+        captures = int(graph.get("captures", 0) or 0)
+        replays = int(graph.get("replays", 0) or 0)
+        if not expected_graph_batches and graph.get("enabled"):
+            errors.append("decode CUDA Graphs were unexpectedly enabled")
+        if batch_size in expected_graph_batches:
+            if not graph.get("enabled"):
+                errors.append(
+                    f"decode CUDA Graphs disabled for promoted batch B{batch_size}"
+                )
+            if captures <= 0 or replays <= 0:
+                errors.append(
+                    f"promoted batch B{batch_size} did not capture and replay its graph"
+                )
+        elif captures > 0 or replays > 0:
+            errors.append(
+                f"decode CUDA Graphs ran outside promoted batches: B{batch_size}"
+            )
+        graph_policy_batches = graph.get("decode_cuda_graph_policy_batches")
+        if graph_policy_batches is not None and tuple(graph_policy_batches) != expected_graph_batches:
+            errors.append(
+                "decode CUDA Graph batch policy does not match the publication profile"
+            )
+        reuse_policy_batches = graph.get("request_scheduler_reuse_policy_batches")
+        if reuse_policy_batches is not None and tuple(reuse_policy_batches) != expected_reuse_batches:
+            errors.append(
+                "request scheduler reuse batch policy does not match the publication profile"
+            )
+        reuse_count = int(graph.get("request_scheduler_reuse_count", 0) or 0)
+        if batch_size in expected_reuse_batches:
+            if reuse_count <= 0:
+                errors.append(
+                    f"promoted batch B{batch_size} did not reuse its request scheduler"
+                )
+        elif not expected_reuse and reuse_count > 0:
+            errors.append(
+                f"request scheduler reuse ran outside promoted batches: B{batch_size}"
+            )
     if graph_failures > 0:
         failure_messages = sorted(
             {
@@ -548,7 +593,9 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
             errors.append("E4B flat decode_step route was never exercised")
         if multi_step_batches > 0:
             errors.append("E4B unexpectedly used the slow decode_multi_step route")
-    elif multi_step_batches <= 0:
+    elif graph_batches_present and decode_step_batches <= 0:
+        errors.append("E2B promoted graph decode_step route was never exercised")
+    elif successful_batches.difference(expected_graph_batches) and multi_step_batches <= 0:
         errors.append("E2B flat decode_multi_step route was never exercised")
 
     request_scheduler_reuse_count = _max_counter(
@@ -556,8 +603,8 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
     )
     if expected_reuse and request_scheduler_reuse_count <= 0:
         errors.append("E4B request scheduler reuse was never exercised")
-    if not expected_reuse and request_scheduler_reuse_count > 0:
-        errors.append("E2B unexpectedly reused the E4B request scheduler path")
+    if not expected_reuse and not expected_reuse_batches and request_scheduler_reuse_count > 0:
+        errors.append("request scheduler was unexpectedly reused")
 
     dense_tail_env_requested = os.environ.get(
         "MEGAGEMM_GEMMA4_DENSE_POST_NORM_CHAIN_DECODE", "0"
@@ -924,7 +971,13 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
                 decode_stats and all(item.get("flat_decode_ready") for item in decode_stats)
             ),
             "decode_mode": (
-                "flat_single_step_eager" if prefer_step else "flat_multi_step_eager"
+                "flat_single_step_eager"
+                if prefer_step
+                else (
+                    "batch_scoped_cuda_graph"
+                    if expected_graph_batches
+                    else "flat_multi_step_eager"
+                )
             ),
             "prefer_step": prefer_step,
             "decode_step_batches": decode_step_batches,
@@ -936,7 +989,11 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
             "decode_cuda_graph_captures": graph_captures,
             "decode_cuda_graph_replays": graph_replays,
             "decode_cuda_graph_failures": graph_failures,
+            "decode_cuda_graph_policy_batches": list(expected_graph_batches),
             "request_scheduler_reuse_expected": expected_reuse,
+            "request_scheduler_reuse_policy_batches": list(
+                expected_reuse_batches
+            ),
             "request_scheduler_reuse_count": request_scheduler_reuse_count,
             "dense_post_norm_chain_required": dense_tail_required,
             "dense_post_norm_chain_enabled": dense_tail_enabled,

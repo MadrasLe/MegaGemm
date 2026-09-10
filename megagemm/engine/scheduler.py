@@ -236,6 +236,7 @@ class Scheduler:
             "MEGAGEMM_REUSE_REQUEST_SCHEDULER",
             "reuse_request_scheduler_batches",
         )
+        self._request_scheduler_reuse_policy_batches = reuse_batches
         self._request_scheduler_reuse_enabled = policy_bool(
             model,
             "MEGAGEMM_REUSE_REQUEST_SCHEDULER",
@@ -3202,6 +3203,12 @@ class Scheduler:
                 'shared_shape_cache': bool(self._decode_cuda_graph_shared_shape_cache),
                 'request_scheduler_reuse_enabled': bool(
                     self._request_scheduler_reuse_enabled
+                ),
+                'request_scheduler_reuse_policy_batches': list(
+                    self._request_scheduler_reuse_policy_batches
+                ),
+                'decode_cuda_graph_policy_batches': list(
+                    self._decode_cuda_graph_policy_batches
                 ),
                 'request_scheduler_reused': bool(self._request_scheduler_reused),
                 'request_scheduler_reuse_count': int(
