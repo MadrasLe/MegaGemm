@@ -136,8 +136,11 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
                 "tok/s (1.111x) and end-to-end throughput from 178.59 to "
                 "190.14 tok/s (1.065x); the statistically tied "
                 "eight-step unrolled graph remains experimental; "
-                "the forced fused LM head and experimental large MLP paths "
-                "remain unpromoted"
+                "the exact M8/K1536/N262144 BF16 LM-head path uses BN64 after "
+                "the paired P512/P2048 x O16/O128 gate improved geometric-mean "
+                "decode throughput by 2.19%, improved every end-to-end scenario, "
+                "and preserved exact greedy tokens; experimental large MLP "
+                "paths remain unpromoted"
             ),
         )
     if topology == (42, 2560, 8, 2):

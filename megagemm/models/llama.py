@@ -14430,6 +14430,9 @@ class MegaGemmLlama(nn.Module):
             "fused_lm_head_argmax_large_k_block_n": int(
                 lm_head_argmax_cfg.get("large_vocab_large_k_block_n", 0) or 0
             ),
+            "fused_lm_head_argmax_gemma4_e2b_l4_b8_block_n": int(
+                lm_head_argmax_cfg.get("gemma4_e2b_l4_b8_block_n", 0) or 0
+            ),
             "gemma4_batch_cublas_lm_head_enabled": bool(
                 _GEMMA4_BATCH_CUBLAS_LM_HEAD
             ),

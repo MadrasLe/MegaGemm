@@ -270,9 +270,30 @@ if _HAS_TRITON:
                 pid_nb * BLOCK_N + local_idx,
             )
 
-def _pick_cfg(k_dim: int, n_dim: int):
+def _pick_cfg(
+    k_dim: int,
+    n_dim: int,
+    *,
+    rows: int = 0,
+    dtype: Optional[torch.dtype] = None,
+    device_name: str = "",
+):
     if _CFG_FORCED_BN > 0 and _CFG_FORCED_BK > 0 and _CFG_FORCED_WARPS > 0:
         return _CFG_FORCED_BN, _CFG_FORCED_BK, _CFG_FORCED_WARPS, max(1, _CFG_FORCED_STAGES or 2)
+
+    # Exact full-model promotion: Gemma 4 E2B decode on L4, batch 8.
+    # The paired P512/P2048 x O16/O128 gate measured BN64 at +2.19%
+    # geometric-mean decode throughput, with all end-to-end scenarios
+    # non-regressing. Keep this guard narrower than the generic large-vocab
+    # heuristic because occupancy depends on M/K/N and the GPU.
+    if (
+        int(rows) == 8
+        and int(k_dim) == 1536
+        and int(n_dim) == 262144
+        and dtype == torch.bfloat16
+        and "L4" in str(device_name).upper()
+    ):
+        return 64, 128, 4, 2
 
     if n_dim >= 65536:
         # For very large vocab projections the hidden width matters a lot.
@@ -466,7 +487,23 @@ def lm_head_argmax(
 
     w = lm_head_weight if lm_head_weight.is_contiguous() else lm_head_weight.contiguous()
     bias_ptr = lm_head_bias if lm_head_bias is not None else x_2d
-    block_n, block_k, num_warps, num_stages = _pick_cfg(k_dim, vocab)
+    device_name = (
+        torch.cuda.get_device_name(x_2d.device)
+        if (
+            m_rows == 8
+            and k_dim == 1536
+            and vocab == 262144
+            and x_2d.dtype == torch.bfloat16
+        )
+        else ""
+    )
+    block_n, block_k, num_warps, num_stages = _pick_cfg(
+        k_dim,
+        vocab,
+        rows=m_rows,
+        dtype=x_2d.dtype,
+        device_name=device_name,
+    )
     n_blocks = triton.cdiv(vocab, block_n)
 
     if (
@@ -601,7 +638,23 @@ def lm_head_rmsnorm_argmax(
     w = lm_head_weight if lm_head_weight.is_contiguous() else lm_head_weight.contiguous()
     norm_w = norm_weight if norm_weight.is_contiguous() else norm_weight.contiguous()
     bias_ptr = lm_head_bias if lm_head_bias is not None else x_2d
-    block_n, block_k, num_warps, num_stages = _pick_cfg(k_dim, vocab)
+    device_name = (
+        torch.cuda.get_device_name(x_2d.device)
+        if (
+            m_rows == 8
+            and k_dim == 1536
+            and vocab == 262144
+            and x_2d.dtype == torch.bfloat16
+        )
+        else ""
+    )
+    block_n, block_k, num_warps, num_stages = _pick_cfg(
+        k_dim,
+        vocab,
+        rows=m_rows,
+        dtype=x_2d.dtype,
+        device_name=device_name,
+    )
     n_blocks = triton.cdiv(vocab, block_n)
 
     if (
@@ -705,6 +758,7 @@ def lm_head_argmax_runtime_config() -> dict:
         "forced_num_stages": int(_CFG_FORCED_STAGES),
         "triton_reduce": bool(_CFG_TRITON_REDUCE),
         "large_vocab_large_k_block_n": 128,
+        "gemma4_e2b_l4_b8_block_n": 64,
         "softcap_block_n": int(_CFG_SOFTCAP_BLOCK_N),
         "softcap_num_warps": int(_CFG_SOFTCAP_NUM_WARPS),
     }

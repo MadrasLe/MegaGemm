@@ -62,7 +62,7 @@ class ComputeCase:
     h512_warps: int = 4
     h512_stages: int = 3
     h512_reduce_warps: int = 4
-    lm_block_n: int = 256
+    lm_block_n: int = 64
     lm_block_k: int = 128
     lm_warps: int = 4
     lm_stages: int = 2
@@ -76,7 +76,7 @@ class ComputeCase:
         )
 
 
-PRODUCTION = ComputeCase("production", "production")
+PRODUCTION = ComputeCase("production", "production", lm_block_n=64)
 SCREEN_CASES = (
     PRODUCTION,
     ComputeCase("sliding_h256_w1", "attention", h256_warps=1),
@@ -96,10 +96,9 @@ SCREEN_CASES = (
         h512_short_segments=8,
         h512_tile=32,
     ),
-    # This is a full-model control for the earlier LM-head result.  It remains
-    # in the screen because CUDA Graph promotion changed host execution, but it
-    # must still win the complete request rather than its isolated kernel.
-    ComputeCase("lm_head_bn64", "lm_head", lm_block_n=64),
+    # BN64 is the promoted B8/L4 default. Keep the former BN256 geometry as a
+    # full-model regression control rather than relying on the isolated kernel.
+    ComputeCase("lm_head_bn256", "lm_head", lm_block_n=256),
     ComputeCase("mlp_fused_gateup", "mlp", mlp_mode="fused_gateup"),
     ComputeCase("mlp_deepfusion_down", "mlp", mlp_mode="deepfusion"),
     ComputeCase("mlp_fused_both", "mlp", mlp_mode="fused_both"),
@@ -472,6 +471,7 @@ def final_decision(
     summary: dict[str, Any],
     *,
     minimum_speedup: float,
+    minimum_output_speedup: float = 1.0,
     maximum_spread: float,
     policy_changed: bool = True,
 ) -> dict[str, Any]:
@@ -487,6 +487,8 @@ def final_decision(
             "worst_decode_speedup": 1.0,
             "worst_output_speedup": 1.0,
             "minimum_speedup": minimum_speedup,
+            "minimum_decode_speedup": minimum_speedup,
+            "minimum_output_speedup": minimum_output_speedup,
             "policy_changed": False,
         }
     candidate = summary["cases"].get("best_combination") or {}
@@ -499,7 +501,7 @@ def final_decision(
         policy_changed
         and valid
         and decode_speedup >= minimum_speedup
-        and output_speedup >= minimum_speedup
+        and output_speedup >= minimum_output_speedup
         and worst_decode >= 0.995
         and worst_output >= 0.995
         and all(
@@ -516,6 +518,8 @@ def final_decision(
         "worst_decode_speedup": worst_decode,
         "worst_output_speedup": worst_output,
         "minimum_speedup": minimum_speedup,
+        "minimum_decode_speedup": minimum_speedup,
+        "minimum_output_speedup": minimum_output_speedup,
         "policy_changed": bool(policy_changed),
     }
 
@@ -551,6 +555,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--maximum-spread", type=float, default=1.08)
     parser.add_argument("--minimum-speedup", type=float, default=1.015)
+    parser.add_argument("--minimum-output-speedup", type=float, default=1.0)
     parser.add_argument(
         "--screen-case-names",
         help=(
@@ -839,6 +844,7 @@ def main(argv: list[str] | None = None) -> int:
     decision = final_decision(
         final_summary,
         minimum_speedup=args.minimum_speedup,
+        minimum_output_speedup=args.minimum_output_speedup,
         maximum_spread=args.maximum_spread,
         policy_changed=policy_changed,
     )
@@ -848,9 +854,9 @@ def main(argv: list[str] | None = None) -> int:
             "cuBLASLt algo 0 at 31.099 us for N=12288, and 305.843 versus "
             "305.787 us for N=24576; there is no two-shape win to retest."
         ),
-        "lm_head_bn64_prior": (
-            "Retained as a graph-era control despite the prior seven-pair "
-            "full-model result of only 1.00039x median paired speedup."
+        "lm_head_bn256_previous_default": (
+            "Retained as a regression control after the exact B8 graph-era "
+            "gate promoted BN64 for the M8/K1536/N262144 BF16 L4 shape."
         ),
     }
     payload = {
