@@ -24,12 +24,13 @@ def test_e2b_l4_policy_preserves_measured_multi_step_triton_path():
     assert policy.prefer_triton_rmsnorm is True
     assert policy.decode_prefer_step is False
     assert policy.reuse_request_scheduler is False
-    assert policy.reuse_request_scheduler_batches == (4,)
+    assert policy.reuse_request_scheduler_batches == (4, 8)
     assert policy.decode_cuda_graphs is True
-    assert policy.decode_cuda_graph_batches == (4,)
+    assert policy.decode_cuda_graph_batches == (4, 8)
     assert policy.decode_cuda_graph_prefer_step is True
     assert policy.decode_graph_multi_step_body is True
     assert policy.decode_graph_persistent_token_feedback is True
+    assert policy.decode_graph_token_burst_by_batch == ((4, 8), (8, 16))
     assert policy.paged_decode_splits == 1
     assert policy.paged_decode_gqa2_direct is True
     assert policy.paged_decode_warps_h256 == 2
@@ -58,6 +59,7 @@ def test_e4b_l4_policy_preserves_measured_step_and_reuse_path():
     assert policy.decode_cuda_graph_prefer_step is False
     assert policy.decode_graph_multi_step_body is False
     assert policy.decode_graph_persistent_token_feedback is False
+    assert policy.decode_graph_token_burst_by_batch == ()
     assert policy.paged_decode_splits == 0
     assert policy.paged_decode_gqa2_direct is False
     assert policy.paged_decode_warps_h256 == 0
@@ -85,6 +87,7 @@ def test_gemma4_policy_is_not_promoted_to_unmeasured_hardware():
     assert policy.decode_cuda_graph_prefer_step is False
     assert policy.decode_graph_multi_step_body is False
     assert policy.decode_graph_persistent_token_feedback is False
+    assert policy.decode_graph_token_burst_by_batch == ()
     assert policy.paged_decode_splits == 0
     assert policy.paged_decode_gqa2_direct is False
     assert policy.paged_decode_warps_h256 == 0
@@ -121,7 +124,8 @@ def test_explicit_environment_flag_overrides_model_policy(monkeypatch):
     ) is False
 
 
-def test_e2b_b4_graph_policy_is_batch_scoped_and_env_overridable(monkeypatch):
+def test_e2b_b4_b8_graph_policy_is_batch_scoped_and_env_overridable(monkeypatch):
+    monkeypatch.delenv("MEGAGEMM_DECODE_CUDA_GRAPHS", raising=False)
     model = SimpleNamespace(
         runtime_policy=resolve_runtime_policy(
             _config(35, 1536, 8, 1), "NVIDIA L4"
@@ -137,7 +141,7 @@ def test_e2b_b4_graph_policy_is_batch_scoped_and_env_overridable(monkeypatch):
         model,
         "MEGAGEMM_DECODE_CUDA_GRAPHS",
         "decode_cuda_graph_batches",
-    ) == (4,)
+    ) == (4, 8)
 
     monkeypatch.setenv("MEGAGEMM_DECODE_CUDA_GRAPHS", "0")
     assert policy_bool(
@@ -152,9 +156,10 @@ def test_e2b_b4_graph_policy_is_batch_scoped_and_env_overridable(monkeypatch):
     ) == ()
 
 
-def test_e2b_request_scheduler_reuse_is_only_promoted_for_b4(monkeypatch):
+def test_e2b_request_scheduler_reuse_is_promoted_for_b4_and_b8(monkeypatch):
     from megagemm.engine.engine import _request_scheduler_reuse_for_batch
 
+    monkeypatch.delenv("MEGAGEMM_REUSE_REQUEST_SCHEDULER", raising=False)
     model = SimpleNamespace(
         runtime_policy=resolve_runtime_policy(
             _config(35, 1536, 8, 1), "NVIDIA L4"
@@ -164,7 +169,7 @@ def test_e2b_request_scheduler_reuse_is_only_promoted_for_b4(monkeypatch):
     assert not _request_scheduler_reuse_for_batch(model, 1)
     assert not _request_scheduler_reuse_for_batch(model, 2)
     assert _request_scheduler_reuse_for_batch(model, 4)
-    assert not _request_scheduler_reuse_for_batch(model, 8)
+    assert _request_scheduler_reuse_for_batch(model, 8)
 
     monkeypatch.setenv("MEGAGEMM_REUSE_REQUEST_SCHEDULER", "1")
     assert _request_scheduler_reuse_for_batch(model, 1)

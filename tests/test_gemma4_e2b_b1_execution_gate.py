@@ -62,6 +62,9 @@ def test_colab_wrapper_selects_b8_batch_and_result_directory():
     assert "EFFECTIVE_BATCH_SIZE=8" in wrapper
     assert "--b8-frontier --skip-python-audit" in wrapper
     assert "gemma4_e2b_b8_execution_frontier" in wrapper
+    assert 'SUITE" == "b8-promotion"' in wrapper
+    assert "B8 promotion gate:" in wrapper
+    assert "gemma4_e2b_b8_graph_promotion" in wrapper
 
 
 def test_execution_audit_rejects_wrong_burst_size_for_graph():
@@ -82,6 +85,13 @@ def test_promotion_case_removes_experiment_overrides(monkeypatch):
     assert promoted.runtime_policy
     assert promoted.reuse and promoted.graph
     assert all(name not in __import__("os").environ for name in controls)
+
+
+def test_b8_promotion_case_uses_runtime_policy_burst16():
+    promoted = gate.B8_PROMOTION_CASES[1]
+    assert promoted.runtime_policy
+    assert promoted.reuse and promoted.graph
+    assert promoted.burst_steps == 16
 
 
 @pytest.mark.parametrize("field,value", [("digest", "wrong"), ("digest", None),
@@ -240,12 +250,12 @@ def test_b4_and_b8_graph_topologies_are_production_eligible(monkeypatch):
 
 def test_graph_runtime_policy_does_not_change_non_b4_decode_dispatch():
     scheduler = object.__new__(Scheduler)
-    scheduler._decode_cuda_graph_policy_batches = (4,)
+    scheduler._decode_cuda_graph_policy_batches = (4, 8)
 
     assert not scheduler._decode_graph_batch_allowed(1)
     assert not scheduler._decode_graph_batch_allowed(2)
     assert scheduler._decode_graph_batch_allowed(4)
-    assert not scheduler._decode_graph_batch_allowed(8)
+    assert scheduler._decode_graph_batch_allowed(8)
 
     scheduler._decode_cuda_graph_policy_batches = ()
     for batch_size in (1, 2, 4, 8):

@@ -28,6 +28,7 @@ class RuntimePolicy:
     decode_cuda_graph_prefer_step: bool = False
     decode_graph_multi_step_body: bool = False
     decode_graph_persistent_token_feedback: bool = False
+    decode_graph_token_burst_by_batch: tuple[tuple[int, int], ...] = ()
     paged_decode_splits: int = 0
     paged_decode_gqa2_direct: bool = False
     paged_decode_warps_h256: int = 0
@@ -85,12 +86,13 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
             prefer_triton_rmsnorm=True,
             decode_prefer_step=False,
             reuse_request_scheduler=False,
-            reuse_request_scheduler_batches=(4,),
+            reuse_request_scheduler_batches=(4, 8),
             decode_cuda_graphs=True,
-            decode_cuda_graph_batches=(4,),
+            decode_cuda_graph_batches=(4, 8),
             decode_cuda_graph_prefer_step=True,
             decode_graph_multi_step_body=True,
             decode_graph_persistent_token_feedback=True,
+            decode_graph_token_burst_by_batch=((4, 8), (8, 16)),
             paged_decode_splits=1,
             paged_decode_gqa2_direct=True,
             paged_decode_warps_h256=2,
@@ -128,7 +130,11 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
                 "one-step CUDA Graph path; the clean default-policy gate then "
                 "raised median decode from 120.99 to 144.77 tok/s (1.197x) "
                 "and end-to-end throughput from 99.65 to 115.17 tok/s "
-                "(1.156x); the statistically tied "
+                "(1.156x). The exact-output B8/P2048/O128 frontier then "
+                "promoted the one-step CUDA Graph with a 16-token scheduler "
+                "burst after raising median decode from 276.40 to 307.17 "
+                "tok/s (1.111x) and end-to-end throughput from 178.59 to "
+                "190.14 tok/s (1.065x); the statistically tied "
                 "eight-step unrolled graph remains experimental; "
                 "the forced fused LM head and experimental large MLP paths "
                 "remain unpromoted"

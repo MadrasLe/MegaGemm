@@ -250,6 +250,28 @@ class Scheduler:
             "MEGAGEMM_DECODE_SKIP_TOKEN_STORE", default=False
         )
         self._decode_multi_step_burst = _get_batch_decode_burst()
+        burst_override = any(
+            os.environ.get(name, "").strip()
+            for name in (
+                "MEGAGEMM_MULTI_STEP_BURST_BATCH",
+                "MEGAGEMM_MULTI_STEP_BURST",
+            )
+        )
+        policy_bursts = () if burst_override else getattr(
+            getattr(model, "runtime_policy", None),
+            "decode_graph_token_burst_by_batch",
+            (),
+        )
+        self._decode_graph_token_burst_by_batch = {
+            int(batch_size): int(burst_size)
+            for batch_size, burst_size in policy_bursts
+            if int(batch_size) > 0 and int(burst_size) > 0
+        }
+        self._decode_burst_capacity = max(
+            (self._decode_multi_step_burst,)
+            + tuple(self._decode_graph_token_burst_by_batch.values())
+        )
+        self._decode_last_token_burst_size = self._decode_multi_step_burst
         # Select the regular one-token decode path independently from CUDA
         # Graphs.  Some model/GPU combinations are faster in the flat
         # decode_step path even when graph capture is intentionally disabled.
@@ -317,7 +339,7 @@ class Scheduler:
         )
         self._decode_burst_tokens = torch.empty(
             max_batch_size,
-            self._decode_multi_step_burst,
+            self._decode_burst_capacity,
             dtype=torch.long,
             device=device,
         )
@@ -334,7 +356,7 @@ class Scheduler:
             )
             self._decode_burst_tokens_host = torch.empty(
                 max_batch_size,
-                self._decode_multi_step_burst,
+                self._decode_burst_capacity,
                 dtype=torch.long,
                 pin_memory=pin_decode_host,
             )
@@ -347,7 +369,7 @@ class Scheduler:
             )
             self._decode_burst_tokens_host = torch.empty(
                 max_batch_size,
-                self._decode_multi_step_burst,
+                self._decode_burst_capacity,
                 dtype=torch.long,
             )
             self._decode_host_buffers_pinned = False
@@ -736,23 +758,36 @@ class Scheduler:
                 and self._decode_graph_batch_allowed(len(requests))
             )
             prefer_decode_step = self._decode_prefer_step or prefer_graph_step
+            decode_burst_size = (
+                self._decode_graph_token_burst_by_batch.get(
+                    len(requests), self._decode_multi_step_burst
+                )
+                if prefer_graph_step
+                else self._decode_multi_step_burst
+            )
+            self._decode_last_token_burst_size = int(decode_burst_size)
             use_graph_token_burst = bool(
                 all_greedy
                 and no_pending
                 and no_stop_tokens
                 and prefer_graph_step
                 and self._decode_graph_token_burst
-                and self._decode_multi_step_burst > 1
+                and decode_burst_size > 1
                 and max_remaining > 1
                 and self._prefers_scheduler_greedy_token_decode(len(requests))
             )
             if use_graph_token_burst:
+                # Count the scheduler iteration as a graph-backed decode-step
+                # dispatch.  Previously this branch was invisible in
+                # decode_execution even though it executed only decode_step
+                # graph replays.
+                self._decode_step_batches += 1
                 finished = self._decode_graph_token_burst_batch(
-                    self._decode_multi_step_burst,
+                    decode_burst_size,
                 )
             elif all_greedy and has_multi_step and no_pending and not prefer_decode_step:
                 self._decode_multi_step_batches += 1
-                finished = self._decode_multi_step_batch(self._decode_multi_step_burst)
+                finished = self._decode_multi_step_batch(decode_burst_size)
             else:
                 self._decode_step_batches += 1
                 finished = self._decode_batch()
@@ -2895,7 +2930,7 @@ class Scheduler:
         actual_steps = min(
             max(1, int(num_steps)),
             max_remaining,
-            self._decode_multi_step_burst,
+            self._decode_burst_capacity,
         )
         if actual_steps <= 1 or any(req.stop_token_ids for req in requests):
             return self._decode_batch()
@@ -3198,7 +3233,13 @@ class Scheduler:
                 'eager_control': bool(self._decode_graph_eager_control),
                 'prefer_step': bool(self._decode_cuda_graph_prefer_step),
                 'token_burst_enabled': bool(self._decode_graph_token_burst),
-                'token_burst_size': int(self._decode_multi_step_burst),
+                'token_burst_size': int(self._decode_last_token_burst_size),
+                'token_burst_policy_by_batch': [
+                    [int(batch_size), int(burst_size)]
+                    for batch_size, burst_size in sorted(
+                        self._decode_graph_token_burst_by_batch.items()
+                    )
+                ],
                 'shape_cache': bool(self._decode_cuda_graph_shape_cache),
                 'shared_shape_cache': bool(self._decode_cuda_graph_shared_shape_cache),
                 'request_scheduler_reuse_enabled': bool(

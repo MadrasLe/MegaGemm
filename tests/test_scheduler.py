@@ -1,4 +1,5 @@
 import contextlib
+from types import SimpleNamespace
 
 import torch
 
@@ -338,6 +339,54 @@ def test_scheduler_graph_token_burst_keeps_feedback_on_device():
     assert scheduler._decode_graph_token_feedback_copies == 2
     assert scheduler._decode_batched_token_host_copies == 1
     assert scheduler._decode_vectorized_input_updates == 1
+
+
+def test_scheduler_uses_model_policy_for_b8_graph_burst_capacity(monkeypatch):
+    from megagemm.models.runtime_policy import resolve_runtime_policy
+
+    monkeypatch.delenv("MEGAGEMM_MULTI_STEP_BURST_BATCH", raising=False)
+    monkeypatch.delenv("MEGAGEMM_MULTI_STEP_BURST", raising=False)
+    config = SimpleNamespace(
+        model_type="gemma4_text",
+        num_hidden_layers=35,
+        hidden_size=1536,
+        num_attention_heads=8,
+        num_key_value_heads=1,
+    )
+    model = SimpleNamespace(
+        runtime_policy=resolve_runtime_policy(config, "NVIDIA L4")
+    )
+    scheduler = Scheduler(
+        model, _FakeBlockManager(), max_batch_size=8, device="cpu"
+    )
+
+    assert scheduler._decode_multi_step_burst == 8
+    assert scheduler._decode_graph_token_burst_by_batch == {4: 8, 8: 16}
+    assert scheduler._decode_burst_capacity == 16
+    assert scheduler._decode_burst_tokens.shape == (8, 16)
+
+
+def test_explicit_burst_override_suppresses_model_batch_policy(monkeypatch):
+    from megagemm.models.runtime_policy import resolve_runtime_policy
+
+    monkeypatch.setenv("MEGAGEMM_MULTI_STEP_BURST_BATCH", "4")
+    config = SimpleNamespace(
+        model_type="gemma4_text",
+        num_hidden_layers=35,
+        hidden_size=1536,
+        num_attention_heads=8,
+        num_key_value_heads=1,
+    )
+    model = SimpleNamespace(
+        runtime_policy=resolve_runtime_policy(config, "NVIDIA L4")
+    )
+    scheduler = Scheduler(
+        model, _FakeBlockManager(), max_batch_size=8, device="cpu"
+    )
+
+    assert scheduler._decode_multi_step_burst == 4
+    assert scheduler._decode_graph_token_burst_by_batch == {}
+    assert scheduler._decode_burst_capacity == 4
 
 
 def test_scheduler_native_graph_burst_avoids_python_decode_loop(monkeypatch):

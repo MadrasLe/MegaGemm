@@ -7,7 +7,7 @@ REPO="${REPO:-/content/drive/MyDrive/mg/MGRrmsnorm}"
 MODEL="${MODEL:-google/gemma-4-E2B-it}"
 export SUITE="${SUITE:-all}"
 GATE="$REPO/benchmarks/run_gemma4_e2b_b1_decode_frontier_gate.py"
-if [[ "$SUITE" == "execution" || "$SUITE" == "graph-kernels" || "$SUITE" == "promotion" || "$SUITE" == "b8-execution" ]]; then
+if [[ "$SUITE" == "execution" || "$SUITE" == "graph-kernels" || "$SUITE" == "promotion" || "$SUITE" == "b8-execution" || "$SUITE" == "b8-promotion" ]]; then
   GATE="$REPO/benchmarks/run_gemma4_e2b_b1_execution_gate.py"
 fi
 
@@ -63,7 +63,7 @@ print("MegaGemm:", source)
 assert source.is_relative_to(repo), (
     f"import veio de {source}, não da pasta do Drive {repo}"
 )
-if os.environ["SUITE"] in ("execution", "graph-kernels", "promotion", "b8-execution"):
+if os.environ["SUITE"] in ("execution", "graph-kernels", "promotion", "b8-execution", "b8-promotion"):
     from megagemm.engine.scheduler import Scheduler
     import triton
     if not callable(getattr(Scheduler, "_decode_graph_model_step", None)):
@@ -76,6 +76,8 @@ if os.environ["SUITE"] in ("execution", "graph-kernels", "promotion", "b8-execut
         print("Promotion gate: eager baseline / default E2B-L4-B4 RuntimePolicy")
     if os.environ["SUITE"] == "b8-execution":
         print("B8 frontier: eager / scheduler reuse / graph bursts 4, 8, 16 / unrolled 8")
+    if os.environ["SUITE"] == "b8-promotion":
+        print("B8 promotion gate: eager baseline / default E2B-L4-B8 RuntimePolicy")
     if os.environ["SUITE"] == "graph-kernels":
         from benchmarks.gemma4_b1_graph_kernels import GraphKernelExperiment
         from megagemm.models.llama import MegaGemmLlama
@@ -99,19 +101,23 @@ PY
 DEFAULT_RUN_PREFIX="gemma4_e2b_b1_decode_frontier"
 DEFAULT_OUT_ROOT="bench_results/gemma4_e2b_b1_decode_frontier"
 EFFECTIVE_BATCH_SIZE="${BATCH_SIZE:-1}"
-if [[ "$SUITE" == "b8-execution" ]]; then
+if [[ "$SUITE" == "b8-execution" || "$SUITE" == "b8-promotion" ]]; then
   if [[ -n "${BATCH_SIZE:-}" && "$BATCH_SIZE" != "8" ]]; then
-    echo "ERRO: SUITE=b8-execution exige BATCH_SIZE=8; recebido $BATCH_SIZE"
+    echo "ERRO: SUITE=$SUITE exige BATCH_SIZE=8; recebido $BATCH_SIZE"
     exit 5
   fi
   EFFECTIVE_BATCH_SIZE=8
   DEFAULT_RUN_PREFIX="gemma4_e2b_b8_execution_frontier"
   DEFAULT_OUT_ROOT="bench_results/gemma4_e2b_b8_execution_frontier"
+  if [[ "$SUITE" == "b8-promotion" ]]; then
+    DEFAULT_RUN_PREFIX="gemma4_e2b_b8_graph_promotion"
+    DEFAULT_OUT_ROOT="bench_results/gemma4_e2b_b8_graph_promotion"
+  fi
 fi
 RUN_ID="${RUN_ID:-${DEFAULT_RUN_PREFIX}_$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT="${OUT:-$REPO/$DEFAULT_OUT_ROOT/$RUN_ID/decision.json}"
 
-if [[ "$SUITE" == "execution" || "$SUITE" == "graph-kernels" || "$SUITE" == "promotion" || "$SUITE" == "b8-execution" ]]; then
+if [[ "$SUITE" == "execution" || "$SUITE" == "graph-kernels" || "$SUITE" == "promotion" || "$SUITE" == "b8-execution" || "$SUITE" == "b8-promotion" ]]; then
   EXTRA_ARGS=()
   if [[ "$SUITE" == "graph-kernels" ]]; then
     EXTRA_ARGS+=(--kernel-candidates --skip-python-audit)
@@ -121,6 +127,9 @@ if [[ "$SUITE" == "execution" || "$SUITE" == "graph-kernels" || "$SUITE" == "pro
   fi
   if [[ "$SUITE" == "b8-execution" ]]; then
     EXTRA_ARGS+=(--b8-frontier --skip-python-audit)
+  fi
+  if [[ "$SUITE" == "b8-promotion" ]]; then
+    EXTRA_ARGS+=(--verify-promotion --skip-python-audit)
   fi
   python -u "$GATE" \
     --model "$MODEL" \

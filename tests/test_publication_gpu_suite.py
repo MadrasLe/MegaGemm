@@ -77,7 +77,7 @@ def test_fast_profile_is_scoped_and_model_specific(monkeypatch):
     assert "MEGAGEMM_DECODE_CUDA_GRAPHS" not in vllm_env
 
 
-def test_e2b_audit_accepts_only_the_promoted_b4_graph_and_reuse(tmp_path):
+def test_e2b_audit_accepts_promoted_b4_b8_graph_and_reuse(tmp_path):
     runner = load_runner()
     raw_path = tmp_path / "e2b_b4.jsonl"
     row = {
@@ -112,8 +112,10 @@ def test_e2b_audit_accepts_only_the_promoted_b4_graph_and_reuse(tmp_path):
                 "replays": 127,
                 "failures": 0,
                 "request_scheduler_reuse_count": 3,
-                "decode_cuda_graph_policy_batches": [4],
-                "request_scheduler_reuse_policy_batches": [4],
+                "decode_cuda_graph_policy_batches": [4, 8],
+                "request_scheduler_reuse_policy_batches": [4, 8],
+                "token_burst_size": 8,
+                "token_burst_policy_by_batch": [[4, 8], [8, 16]],
             },
             "decode_execution": {
                 "prefer_step": False,
@@ -130,8 +132,11 @@ def test_e2b_audit_accepts_only_the_promoted_b4_graph_and_reuse(tmp_path):
 
     assert report["status"] == "passed"
     assert report["required"]["decode_mode"] == "batch_scoped_cuda_graph"
-    assert report["required"]["decode_cuda_graph_policy_batches"] == [4]
-    assert report["required"]["request_scheduler_reuse_policy_batches"] == [4]
+    assert report["required"]["decode_cuda_graph_policy_batches"] == [4, 8]
+    assert report["required"]["request_scheduler_reuse_policy_batches"] == [4, 8]
+    assert report["required"]["decode_graph_token_burst_by_batch"] == [
+        [4, 8], [8, 16]
+    ]
 
     row["batch_size"] = 2
     raw_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
@@ -428,10 +433,21 @@ def test_e2b_audit_proves_batch8_cublas_mlp_policy_and_zero_fusion_hits(tmp_path
             },
         },
         "scheduler_stats": {
+            "decode_cuda_graphs": {
+                "enabled": True,
+                "captures": 1,
+                "replays": 127,
+                "failures": 0,
+                "request_scheduler_reuse_count": 3,
+                "decode_cuda_graph_policy_batches": [4, 8],
+                "request_scheduler_reuse_policy_batches": [4, 8],
+                "token_burst_size": 16,
+                "token_burst_policy_by_batch": [[4, 8], [8, 16]],
+            },
             "decode_execution": {
                 "prefer_step": False,
-                "decode_step_batches": 0,
-                "multi_step_batches": 128,
+                "decode_step_batches": 16,
+                "multi_step_batches": 0,
             },
         },
     }
@@ -524,10 +540,21 @@ def test_e2b_audit_requires_promoted_l4_long_sliding_prefill_hits(tmp_path):
             },
         },
         "scheduler_stats": {
+            "decode_cuda_graphs": {
+                "enabled": True,
+                "captures": 1,
+                "replays": 127,
+                "failures": 0,
+                "request_scheduler_reuse_count": 3,
+                "decode_cuda_graph_policy_batches": [4, 8],
+                "request_scheduler_reuse_policy_batches": [4, 8],
+                "token_burst_size": 16,
+                "token_burst_policy_by_batch": [[4, 8], [8, 16]],
+            },
             "decode_execution": {
                 "prefer_step": False,
-                "decode_step_batches": 0,
-                "multi_step_batches": 128,
+                "decode_step_batches": 16,
+                "multi_step_batches": 0,
             },
         },
     }

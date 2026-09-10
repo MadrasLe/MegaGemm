@@ -71,8 +71,8 @@ GEMMA4_DENSE_COMMON_PROFILE = {
 
 
 # Preserve E2B's measured L4 paths. Scheduler/graph selection intentionally
-# comes from RuntimePolicy because it is batch-scoped: B4 uses the promoted
-# one-step CUDA Graph, while B1/B2/B8 keep their independently measured paths.
+# comes from RuntimePolicy because it is batch-scoped: B4 and B8 use their
+# independently promoted one-step CUDA Graph/burst policies; B1/B2 stay eager.
 GEMMA4_E2B_FAST_PROFILE = {
     **GEMMA4_DENSE_COMMON_PROFILE,
     "MEGAGEMM_DISABLE_CUDA_RMSNORM": "1",
@@ -102,8 +102,9 @@ GEMMA4_PROFILE_REQUIREMENTS = {
         "model_marker": "e2b",
         "prefer_step": False,
         "reuse_scheduler": False,
-        "decode_cuda_graph_batches": (4,),
-        "reuse_scheduler_batches": (4,),
+        "decode_cuda_graph_batches": (4, 8),
+        "reuse_scheduler_batches": (4, 8),
+        "decode_graph_token_burst_by_batch": ((4, 8), (8, 16)),
         "require_dense_post_norm_chain": True,
         "require_e2b_h512_dense_bridge_pair": True,
         "require_bf16_batch8_cublas_mlp": True,
@@ -460,6 +461,12 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
     expected_reuse_batches = tuple(
         int(value) for value in requirement.get("reuse_scheduler_batches", ())
     )
+    expected_graph_bursts = {
+        int(batch_size): int(burst_size)
+        for batch_size, burst_size in requirement.get(
+            "decode_graph_token_burst_by_batch", ()
+        )
+    }
     successful_batches = {
         int(row.get("batch_size", 0) or 0) for row in successful
     }
@@ -514,7 +521,7 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
         errors.append(f"flat decode not ready: {', '.join(reasons)}")
     if decode_stats and any(item.get("flat_decode_failed") for item in decode_stats):
         errors.append("flat decode reported a runtime failure")
-    # Graph/reuse can be global (E4B reuse) or batch-scoped (E2B B4 graph).
+    # Graph/reuse can be global (E4B reuse) or batch-scoped (E2B B4/B8 graph).
     # Only rows for a promoted batch may capture or replay a graph.
     if (expected_reuse or graph_batches_present or reuse_batches_present) and len(
         graph_stats
@@ -544,6 +551,13 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
                 errors.append(
                     f"promoted batch B{batch_size} did not capture and replay its graph"
                 )
+            expected_burst = expected_graph_bursts.get(batch_size)
+            actual_burst = int(graph.get("token_burst_size", 0) or 0)
+            if expected_burst is not None and actual_burst != expected_burst:
+                errors.append(
+                    f"promoted batch B{batch_size} used graph burst "
+                    f"{actual_burst}, expected {expected_burst}"
+                )
         elif captures > 0 or replays > 0:
             errors.append(
                 f"decode CUDA Graphs ran outside promoted batches: B{batch_size}"
@@ -558,6 +572,16 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
             errors.append(
                 "request scheduler reuse batch policy does not match the publication profile"
             )
+        graph_burst_policy = graph.get("token_burst_policy_by_batch")
+        if graph_burst_policy is not None:
+            observed_graph_bursts = {
+                int(batch_size): int(burst_size)
+                for batch_size, burst_size in graph_burst_policy
+            }
+            if observed_graph_bursts != expected_graph_bursts:
+                errors.append(
+                    "decode graph token-burst policy does not match the publication profile"
+                )
         reuse_count = int(graph.get("request_scheduler_reuse_count", 0) or 0)
         if batch_size in expected_reuse_batches:
             if reuse_count <= 0:
@@ -994,6 +1018,10 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
             "request_scheduler_reuse_policy_batches": list(
                 expected_reuse_batches
             ),
+            "decode_graph_token_burst_by_batch": [
+                [int(batch_size), int(burst_size)]
+                for batch_size, burst_size in sorted(expected_graph_bursts.items())
+            ],
             "request_scheduler_reuse_count": request_scheduler_reuse_count,
             "dense_post_norm_chain_required": dense_tail_required,
             "dense_post_norm_chain_enabled": dense_tail_enabled,

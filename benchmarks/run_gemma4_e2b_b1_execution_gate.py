@@ -67,6 +67,17 @@ B8_FRONTIER_CASES = (
     Case("unrolled_graph8", reuse=True, graph=True, unroll=True, burst_steps=8),
 )
 
+B8_PROMOTION_CASES = (
+    B8_FRONTIER_CASES[0],
+    Case(
+        "promoted_b8_policy",
+        reuse=True,
+        graph=True,
+        runtime_policy=True,
+        burst_steps=16,
+    ),
+)
+
 
 def case_environment(case):
     return {
@@ -320,7 +331,7 @@ def main(argv=None):
     parser.add_argument("--kernel-candidates", action="store_true",
                         help="compare five kernel variants, all inside a one-step graph")
     parser.add_argument("--verify-promotion", action="store_true",
-                        help="compare eager baseline with the default B4 RuntimePolicy")
+                        help="compare eager baseline with the default B4/B8 RuntimePolicy")
     parser.add_argument("--b8-frontier", action="store_true",
                         help="compare B8 full-model graph burst sizes 4/8/16")
     parser.add_argument("--output", type=Path, required=True)
@@ -334,8 +345,8 @@ def main(argv=None):
         args.kernel_candidates, args.verify_promotion, args.b8_frontier
     )) > 1:
         parser.error("kernel, promotion, and B8 frontier modes are separate gates")
-    if args.verify_promotion and args.batch_size != 4:
-        parser.error("the promoted RuntimePolicy is specialized for batch_size=4")
+    if args.verify_promotion and args.batch_size not in (4, 8):
+        parser.error("the promoted RuntimePolicy is specialized for batch_size=4 or 8")
     if args.b8_frontier and args.batch_size != 8:
         parser.error("the B8 frontier requires batch_size=8")
     _configure_environment(args.model, -1)
@@ -361,7 +372,7 @@ def main(argv=None):
         experiment.cases
         if experiment
         else (
-            PROMOTION_CASES
+            (B8_PROMOTION_CASES if args.batch_size == 8 else PROMOTION_CASES)
             if args.verify_promotion
             else (B8_FRONTIER_CASES if args.b8_frontier else CASES)
         )
