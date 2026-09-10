@@ -2,10 +2,10 @@
 """One-load, full-model Gemma 4 E2B/L4/B8 compute frontier.
 
 The screen keeps the promoted one-step CUDA Graph with a 16-token scheduler
-burst fixed and changes only one compute family at a time.  Every candidate is
-measured on P512/P2048 and O16/O128 with natural greedy tokens.  A fresh paired
-production-versus-combination phase validates the family winners after the
-screen, without loading the model again.
+burst fixed and changes only one compute family at a time.  Screen workloads
+are selectable; the final paired production-versus-combination phase always
+validates P512/P2048 and O16/O128 with natural greedy tokens, without loading
+the model again.
 
 This is deliberately not a kernel microbenchmark.  Setup, compilation and graph
 capture are excluded from measured samples, and no profiler runs in the timing
@@ -66,6 +66,7 @@ class ComputeCase:
     lm_block_k: int = 128
     lm_warps: int = 4
     lm_stages: int = 2
+    lm_triton_reduce: bool = True
     mlp_mode: str = "production"
 
     def h512_segments(self, prompt_tokens: int) -> int:
@@ -96,12 +97,31 @@ SCREEN_CASES = (
         h512_short_segments=8,
         h512_tile=32,
     ),
-    # BN64 is the promoted B8/L4 default. Keep the former BN256 geometry as a
-    # full-model regression control rather than relying on the isolated kernel.
+    # LM-head frontier. BN64/BK128/W4/S2/TRITON_REDUCE=1 is production.
+    ComputeCase("lm_head_bn32", "lm_head", lm_block_n=32),
+    ComputeCase("lm_head_bn128", "lm_head", lm_block_n=128),
+    ComputeCase("lm_head_bk64", "lm_head", lm_block_k=64),
+    ComputeCase("lm_head_bk256", "lm_head", lm_block_k=256),
+    ComputeCase("lm_head_w2", "lm_head", lm_warps=2),
+    ComputeCase("lm_head_w8", "lm_head", lm_warps=8),
+    ComputeCase("lm_head_s1", "lm_head", lm_stages=1),
+    ComputeCase("lm_head_s3", "lm_head", lm_stages=3),
+    ComputeCase(
+        "lm_head_torch_reduce",
+        "lm_head",
+        lm_triton_reduce=False,
+    ),
+    # Former default retained as a regression control.
     ComputeCase("lm_head_bn256", "lm_head", lm_block_n=256),
     ComputeCase("mlp_fused_gateup", "mlp", mlp_mode="fused_gateup"),
     ComputeCase("mlp_deepfusion_down", "mlp", mlp_mode="deepfusion"),
     ComputeCase("mlp_fused_both", "mlp", mlp_mode="fused_both"),
+)
+
+FINAL_WORKLOADS = tuple(
+    Workload(prompt, output)
+    for prompt in (512, 2048)
+    for output in (16, 128)
 )
 
 
@@ -121,6 +141,36 @@ def select_screen_cases(names: str | None) -> tuple[ComputeCase, ...]:
             selected.append(by_name[name])
             seen.add(name)
     return tuple(selected)
+
+
+def select_screen_workloads(
+    prompt_tokens: str,
+    output_tokens: str,
+) -> tuple[Workload, ...]:
+    def parse(raw: str, label: str) -> set[int]:
+        try:
+            values = {int(item.strip()) for item in raw.split(",") if item.strip()}
+        except ValueError as exc:
+            raise ValueError(f"invalid {label}: {raw}") from exc
+        if not values:
+            raise ValueError(f"{label} cannot be empty")
+        return values
+
+    prompts = parse(prompt_tokens, "screen prompt tokens")
+    outputs = parse(output_tokens, "screen output tokens")
+    supported_prompts = {workload.prompt_tokens for workload in FINAL_WORKLOADS}
+    supported_outputs = {workload.output_tokens for workload in FINAL_WORKLOADS}
+    bad_prompts = sorted(prompts - supported_prompts)
+    bad_outputs = sorted(outputs - supported_outputs)
+    if bad_prompts:
+        raise ValueError(f"unsupported screen prompt token(s): {bad_prompts}")
+    if bad_outputs:
+        raise ValueError(f"unsupported screen output token(s): {bad_outputs}")
+    return tuple(
+        workload
+        for workload in FINAL_WORKLOADS
+        if workload.prompt_tokens in prompts and workload.output_tokens in outputs
+    )
 
 CONTROLLED_ATTENTION_ENV = (
     "MEGAGEMM_PAGED_DECODE_WARPS_H256",
@@ -244,7 +294,7 @@ def _apply_case(
     lm_kernel._CFG_FORCED_BK = int(case.lm_block_k)
     lm_kernel._CFG_FORCED_WARPS = int(case.lm_warps)
     lm_kernel._CFG_FORCED_STAGES = int(case.lm_stages)
-    lm_kernel._CFG_TRITON_REDUCE = True
+    lm_kernel._CFG_TRITON_REDUCE = bool(case.lm_triton_reduce)
 
     _restore_mlp_state(model, production_mlp_state)
     if case.mlp_mode in ("fused_gateup", "fused_both"):
@@ -335,6 +385,24 @@ def _attention_route_errors(
             f"H512 route selected tile {selected_tiles.get(topology)}, "
             f"expected {case.h512_tile}"
         )
+    return errors
+
+
+def _lm_route_errors(case: ComputeCase, lm_kernel: Any) -> list[str]:
+    runtime = lm_kernel.lm_head_argmax_runtime_config()
+    expected = {
+        "forced_block_n": int(case.lm_block_n),
+        "forced_block_k": int(case.lm_block_k),
+        "forced_num_warps": int(case.lm_warps),
+        "forced_num_stages": int(case.lm_stages),
+        "triton_reduce": bool(case.lm_triton_reduce),
+    }
+    errors: list[str] = []
+    for key, value in expected.items():
+        if runtime.get(key) != value:
+            errors.append(
+                f"LM-head route {key}={runtime.get(key)!r}, expected {value!r}"
+            )
     return errors
 
 
@@ -462,6 +530,7 @@ def combine_family_winners(
         lm_block_k=lm_head.lm_block_k,
         lm_warps=lm_head.lm_warps,
         lm_stages=lm_head.lm_stages,
+        lm_triton_reduce=lm_head.lm_triton_reduce,
         mlp_mode=mlp.mlp_mode,
     )
     return combined
@@ -563,6 +632,16 @@ def main(argv: list[str] | None = None) -> int:
             "included"
         ),
     )
+    parser.add_argument(
+        "--screen-prompt-tokens",
+        default="512,2048",
+        help="screen-only prompt lengths; final validation always uses 512,2048",
+    )
+    parser.add_argument(
+        "--screen-output-tokens",
+        default="16,128",
+        help="screen-only output lengths; final validation always uses 16,128",
+    )
     parser.add_argument("--max-seq-len", type=int, default=2304)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cache-dir")
@@ -571,6 +650,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("screen/final repeats must be >=2 and warmups must be >=1")
     try:
         screen_cases = select_screen_cases(args.screen_case_names)
+        screen_workloads = select_screen_workloads(
+            args.screen_prompt_tokens,
+            args.screen_output_tokens,
+        )
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -599,18 +682,19 @@ def main(argv: list[str] | None = None) -> int:
     # lazily in _prepare_flat_decode().  Capture only after that initialization;
     # the constructor's empty tuples are not the production policy.
     production_mlp_state = _prepare_production_mlp_state(model)
-    workloads = tuple(
-        Workload(prompt, output)
-        for prompt in (512, 2048)
-        for output in (16, 128)
-    )
+    final_workloads = FINAL_WORKLOADS
     prompts = {
         prompt: matrix.build_prompts(engine.tokenizer, 8, prompt)[0]
         for prompt in (512, 2048)
     }
     print("Gemma 4 E2B/L4/B8 full-model compute frontier", flush=True)
     print("  fixed execution: one-step CUDA Graph / scheduler burst 16", flush=True)
-    print("  workloads: P512/P2048 x O16/O128", flush=True)
+    print(
+        "  screen workloads: "
+        + ", ".join(workload.key for workload in screen_workloads),
+        flush=True,
+    )
+    print("  final workloads: P512/P2048 x O16/O128", flush=True)
     print(f"  screen cases: {len(screen_cases)}", flush=True)
     print(
         "  selected: " + ", ".join(case.name for case in screen_cases),
@@ -658,7 +742,7 @@ def main(argv: list[str] | None = None) -> int:
         short_references[prompt_tokens] = run_case(
             PRODUCTION, Workload(prompt_tokens, 1)
         )
-    for workload in workloads:
+    for workload in final_workloads:
         references[workload.key] = run_case(PRODUCTION, workload)
         effective = effective_max_prompt_tokens(references[workload.key], 8)
         if effective + workload.output_tokens > args.max_seq_len:
@@ -668,62 +752,96 @@ def main(argv: list[str] | None = None) -> int:
             )
     checkpoint("references_complete")
 
-    # Compile/capture outside the measurement region and prove that each case
-    # actually selected its requested route.
-    for case in screen_cases:
-        # References own production graphs too.  Discard every saved owner once
-        # here so setup always performs a fresh capture and the route audit sees
-        # the Python-side kernel selection that graph replay intentionally skips.
-        _discard_case_schedulers(schedulers, case, workloads)
-        for workload in workloads:
-            short_errors: list[str] = []
-            if workload.output_tokens == 16:
-                short_workload = Workload(workload.prompt_tokens, 1)
+    def setup_cases(
+        cases: tuple[ComputeCase, ...],
+        phase_workloads: tuple[Workload, ...],
+        *,
+        audit_prefix: str,
+        stage: str,
+        checkpoint_extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Compile, capture, warm and audit without admitting setup into timing."""
+        extra = checkpoint_extra or {}
+        for case in cases:
+            # Reference and previous-phase schedulers may own graphs for the
+            # same logical case. A phase gets fresh, explicitly audited owners.
+            _discard_case_schedulers(schedulers, case, phase_workloads)
+            short_errors_by_prompt: dict[int, list[str]] = {}
+            for prompt_tokens in sorted(
+                {workload.prompt_tokens for workload in phase_workloads}
+            ):
+                short_workload = Workload(prompt_tokens, 1)
                 run_case(case, short_workload)
-                short_row = run_case(case, short_workload)
-                short_errors = _validate_measurement(
+                short_row = None
+                for _ in range(args.warmups):
+                    short_row = run_case(case, short_workload)
+                assert short_row is not None
+                short_errors_by_prompt[prompt_tokens] = _validate_measurement(
                     short_row,
-                    short_references[workload.prompt_tokens],
+                    short_references[prompt_tokens],
                     short_workload,
                 )
-            before = _counter_snapshot(model)
-            # First call owns compilation/capture; the following calls prove
-            # steady reuse.  Neither is admitted into measured samples.
-            run_case(case, workload)
-            cold_runtime = model.decode_runtime_stats()
-            row = None
-            for _ in range(args.warmups):
-                row = run_case(case, workload)
-            after = _counter_snapshot(model)
-            assert row is not None
-            errors = short_errors + _validate_measurement(
-                row, references[workload.key], workload
-            )
-            delta = _counter_delta(before, after)
-            errors.extend(_route_errors(case, delta))
-            errors.extend(_attention_route_errors(case, workload, cold_runtime))
-            setup_audits[f"{case.name}/{workload.key}"] = {
-                "errors": errors,
-                "counter_delta": delta,
-                "scheduler_stats": row["scheduler_stats"],
-                "capture_runtime_stats": cold_runtime,
-                "steady_runtime_stats": model.decode_runtime_stats(),
-            }
-            checkpoint("screen_setup", current=f"{case.name}/{workload.key}")
-            if errors:
-                print(
-                    f"SETUP REJECT {case.name}/{workload.key}: {errors}",
-                    flush=True,
+
+            for workload in phase_workloads:
+                before = _counter_snapshot(model)
+                # First call owns compilation/capture; following calls prove
+                # steady reuse. Neither is admitted into measured samples.
+                run_case(case, workload)
+                cold_runtime = model.decode_runtime_stats()
+                row = None
+                for _ in range(args.warmups):
+                    row = run_case(case, workload)
+                after = _counter_snapshot(model)
+                assert row is not None
+                errors = list(short_errors_by_prompt[workload.prompt_tokens])
+                errors.extend(
+                    _validate_measurement(row, references[workload.key], workload)
                 )
+                delta = _counter_delta(before, after)
+                errors.extend(_route_errors(case, delta))
+                errors.extend(
+                    _attention_route_errors(case, workload, cold_runtime)
+                )
+                errors.extend(_lm_route_errors(case, lm_kernel))
+                lm_runtime = lm_kernel.lm_head_argmax_runtime_config()
+                audit_key = f"{audit_prefix}{case.name}/{workload.key}"
+                setup_audits[audit_key] = {
+                    "errors": errors,
+                    "counter_delta": delta,
+                    "lm_head_runtime_config": lm_runtime,
+                    "scheduler_stats": row["scheduler_stats"],
+                    "capture_runtime_stats": cold_runtime,
+                    "steady_runtime_stats": model.decode_runtime_stats(),
+                }
+                checkpoint(
+                    stage,
+                    current=f"{case.name}/{workload.key}",
+                    **extra,
+                )
+                if errors:
+                    print(
+                        f"SETUP REJECT {case.name}/{workload.key}: {errors}",
+                        flush=True,
+                    )
+
+    # Compile/capture outside the measurement region and prove that every case
+    # selected the requested attention, LM-head and MLP routes.
+    setup_cases(
+        screen_cases,
+        screen_workloads,
+        audit_prefix="",
+        stage="screen_setup",
+    )
 
     def measure(
         cases: tuple[ComputeCase, ...],
         repeats: int,
         phase: str,
+        phase_workloads: tuple[Workload, ...],
     ) -> list[dict[str, Any]]:
         rows = phase_samples[phase]
         for repeat in range(repeats):
-            for workload in workloads:
+            for workload in phase_workloads:
                 for case in _rotated(cases, repeat):
                     audit_key = (
                         f"final/{case.name}/{workload.key}"
@@ -773,11 +891,16 @@ def main(argv: list[str] | None = None) -> int:
                     )
         return rows
 
-    screen_samples = measure(screen_cases, args.screen_repeats, "screen")
+    screen_samples = measure(
+        screen_cases,
+        args.screen_repeats,
+        "screen",
+        screen_workloads,
+    )
     screen = summarize_screen(
         screen_samples,
         screen_cases,
-        workloads,
+        screen_workloads,
         repeats=args.screen_repeats,
         maximum_spread=args.maximum_spread,
     )
@@ -794,50 +917,26 @@ def main(argv: list[str] | None = None) -> int:
     # If every family lost the screen, a second copy of production cannot add
     # evidence.  Measure production once in the final phase and exit cleanly.
     final_cases = (PRODUCTION, combined) if policy_changed else (PRODUCTION,)
-    for case in final_cases:
-        for workload in workloads:
-            schedulers.pop((case.name, workload.key), None)
-            schedulers.pop((case.name, Workload(workload.prompt_tokens, 1).key), None)
-    for case in final_cases:
-        for workload in workloads:
-            short_errors: list[str] = []
-            if workload.output_tokens == 16:
-                short_workload = Workload(workload.prompt_tokens, 1)
-                run_case(case, short_workload)
-                short_row = run_case(case, short_workload)
-                short_errors = _validate_measurement(
-                    short_row,
-                    short_references[workload.prompt_tokens],
-                    short_workload,
-                )
-            before = _counter_snapshot(model)
-            run_case(case, workload)
-            cold_runtime = model.decode_runtime_stats()
-            row = run_case(case, workload)
-            after = _counter_snapshot(model)
-            errors = short_errors + _validate_measurement(
-                row, references[workload.key], workload
-            )
-            delta = _counter_delta(before, after)
-            errors.extend(_route_errors(case, delta))
-            errors.extend(_attention_route_errors(case, workload, cold_runtime))
-            setup_audits[f"final/{case.name}/{workload.key}"] = {
-                "errors": errors,
-                "counter_delta": delta,
-                "scheduler_stats": row["scheduler_stats"],
-                "capture_runtime_stats": cold_runtime,
-            }
-            checkpoint(
-                "final_setup",
-                current=f"{case.name}/{workload.key}",
-                screen=screen,
-                combined_case=asdict(combined),
-            )
-    final_samples = measure(final_cases, args.final_repeats, "final")
+    setup_cases(
+        final_cases,
+        final_workloads,
+        audit_prefix="final/",
+        stage="final_setup",
+        checkpoint_extra={
+            "screen": screen,
+            "combined_case": asdict(combined),
+        },
+    )
+    final_samples = measure(
+        final_cases,
+        args.final_repeats,
+        "final",
+        final_workloads,
+    )
     final_summary = summarize_screen(
         final_samples,
         final_cases,
-        workloads,
+        final_workloads,
         repeats=args.final_repeats,
         maximum_spread=args.maximum_spread,
     )
@@ -872,7 +971,12 @@ def main(argv: list[str] | None = None) -> int:
             "execution": "default E2B/L4 B8 RuntimePolicy graph burst16",
             "natural_greedy_tokens": True,
             "profiler_in_timing": False,
-            "workloads": [asdict(workload) for workload in workloads],
+            "screen_workloads": [
+                asdict(workload) for workload in screen_workloads
+            ],
+            "final_workloads": [
+                asdict(workload) for workload in final_workloads
+            ],
         },
         "screen": screen,
         "screen_samples": screen_samples,

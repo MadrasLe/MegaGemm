@@ -46,6 +46,8 @@ python -u benchmarks/run_gemma4_e2b_b8_compute_frontier.py \
   --screen-repeats "${SCREEN_REPEATS:-2}" \
   --final-repeats "${FINAL_REPEATS:-3}" \
   --warmups "${WARMUPS:-1}" \
+  --screen-prompt-tokens "${SCREEN_PROMPT_TOKENS:-512,2048}" \
+  --screen-output-tokens "${SCREEN_OUTPUT_TOKENS:-16,128}" \
   --output "$OUT" \
   "${EXTRA_ARGS[@]}"
 

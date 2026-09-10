@@ -45,11 +45,7 @@ def test_restore_mlp_state_accepts_unmaterialized_optional_caches():
 
 
 def test_compute_frontier_covers_context_and_generation_shapes():
-    workloads = tuple(
-        gate.Workload(prompt, output)
-        for prompt in (512, 2048)
-        for output in (16, 128)
-    )
+    workloads = gate.FINAL_WORKLOADS
     assert [workload.key for workload in workloads] == [
         "p512_o16",
         "p512_o128",
@@ -62,6 +58,47 @@ def test_compute_frontier_covers_context_and_generation_shapes():
         "lm_head",
         "mlp",
     }
+
+
+def test_lm_head_frontier_changes_one_dimension_at_a_time():
+    by_name = {case.name: case for case in gate.SCREEN_CASES}
+    expected = {
+        "lm_head_bn32": (32, 128, 4, 2, True),
+        "lm_head_bn128": (128, 128, 4, 2, True),
+        "lm_head_bk64": (64, 64, 4, 2, True),
+        "lm_head_bk256": (64, 256, 4, 2, True),
+        "lm_head_w2": (64, 128, 2, 2, True),
+        "lm_head_w8": (64, 128, 8, 2, True),
+        "lm_head_s1": (64, 128, 4, 1, True),
+        "lm_head_s3": (64, 128, 4, 3, True),
+        "lm_head_torch_reduce": (64, 128, 4, 2, False),
+    }
+    for name, config in expected.items():
+        case = by_name[name]
+        assert (
+            case.lm_block_n,
+            case.lm_block_k,
+            case.lm_warps,
+            case.lm_stages,
+            case.lm_triton_reduce,
+        ) == config
+
+
+def test_lm_frontier_screen_can_use_only_long_generation():
+    workloads = gate.select_screen_workloads("512,2048", "128")
+    assert [workload.key for workload in workloads] == [
+        "p512_o128",
+        "p2048_o128",
+    ]
+
+
+def test_screen_workload_selector_rejects_unsupported_shape():
+    try:
+        gate.select_screen_workloads("1024", "128")
+    except ValueError as exc:
+        assert "1024" in str(exc)
+    else:
+        raise AssertionError("unsupported workload was accepted")
 
 
 def test_targeted_screen_always_includes_production_once():
@@ -127,13 +164,53 @@ def test_attention_route_audit_rejects_silent_production_replay():
     assert errors == ["H512 route selected 32 segments, expected 8"]
 
 
+def test_lm_route_audit_checks_every_forced_dimension():
+    case = gate.ComputeCase(
+        "lm_custom",
+        "lm_head",
+        lm_block_n=32,
+        lm_block_k=64,
+        lm_warps=8,
+        lm_stages=3,
+        lm_triton_reduce=False,
+    )
+
+    class Kernel:
+        @staticmethod
+        def lm_head_argmax_runtime_config():
+            return {
+                "forced_block_n": 32,
+                "forced_block_k": 64,
+                "forced_num_warps": 8,
+                "forced_num_stages": 3,
+                "triton_reduce": False,
+            }
+
+    assert gate._lm_route_errors(case, Kernel) == []
+    Kernel.lm_head_argmax_runtime_config = staticmethod(
+        lambda: {
+            "forced_block_n": 64,
+            "forced_block_k": 64,
+            "forced_num_warps": 8,
+            "forced_num_stages": 3,
+            "triton_reduce": False,
+        }
+    )
+    assert "forced_block_n=64" in gate._lm_route_errors(case, Kernel)[0]
+
+
 def test_screen_selects_family_winners_and_builds_combination():
     cases = (
         gate.PRODUCTION,
         gate.ComputeCase(
             "attention_win", "attention", h512_short_segments=8
         ),
-        gate.ComputeCase("lm_loss", "lm_head", lm_block_n=256),
+        gate.ComputeCase(
+            "lm_loss",
+            "lm_head",
+            lm_block_n=256,
+            lm_triton_reduce=False,
+        ),
         gate.ComputeCase("mlp_win", "mlp", mlp_mode="fused_gateup"),
     )
     workloads = (gate.Workload(512, 16), gate.Workload(2048, 128))
@@ -159,7 +236,27 @@ def test_screen_selects_family_winners_and_builds_combination():
     combined = gate.combine_family_winners(cases, summary["family_winners"])
     assert combined.h512_short_segments == 8
     assert combined.lm_block_n == 64
+    assert combined.lm_triton_reduce is True
     assert combined.mlp_mode == "fused_gateup"
+
+
+def test_combination_propagates_lm_reduction_policy():
+    lm_winner = gate.ComputeCase(
+        "lm_winner",
+        "lm_head",
+        lm_block_n=32,
+        lm_triton_reduce=False,
+    )
+    combined = gate.combine_family_winners(
+        (gate.PRODUCTION, lm_winner),
+        {
+            "attention": "production",
+            "lm_head": "lm_winner",
+            "mlp": "production",
+        },
+    )
+    assert combined.lm_block_n == 32
+    assert combined.lm_triton_reduce is False
 
 
 def test_final_decision_requires_decode_and_end_to_end_win():
@@ -249,3 +346,28 @@ def test_colab_wrapper_uses_drive_without_git_or_vllm():
     assert "SCREEN_REPEATS" in wrapper
     assert "FINAL_REPEATS" in wrapper
     assert "SCREEN_CASE_NAMES" in wrapper
+    assert "SCREEN_PROMPT_TOKENS" in wrapper
+    assert "SCREEN_OUTPUT_TOKENS" in wrapper
+
+
+def test_lm_frontier_wrapper_is_drive_native_and_targets_o128_screen():
+    wrapper = (
+        gate.ROOT / "benchmarks" /
+        "run_gemma4_e2b_b8_lm_head_frontier_colab.sh"
+    ).read_text(encoding="utf-8")
+    assert "/content/drive/MyDrive/mg/MGRrmsnorm" in wrapper
+    assert "git pull" not in wrapper
+    assert "vllm" not in wrapper.lower()
+    assert "SCREEN_OUTPUT_TOKENS=\"${SCREEN_OUTPUT_TOKENS:-128}\"" in wrapper
+    for name in (
+        "lm_head_bn32",
+        "lm_head_bn128",
+        "lm_head_bk64",
+        "lm_head_bk256",
+        "lm_head_w2",
+        "lm_head_w8",
+        "lm_head_s1",
+        "lm_head_s3",
+        "lm_head_torch_reduce",
+    ):
+        assert name in wrapper
