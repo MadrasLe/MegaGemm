@@ -1,5 +1,6 @@
 import contextlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,9 @@ import torch
 
 from benchmarks import run_gemma4_e2b_b1_execution_gate as gate
 from megagemm.engine.scheduler import Scheduler
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def row(tokens=128, elapsed=3.7):
@@ -29,6 +33,42 @@ def test_case_matrix_only_changes_execution():
         assert env["MEGAGEMM_NATIVE_DECODE_GRAPH_BURST"] == "0"
         assert not any("GEMV" in k or "LM_HEAD" in k or "GATEUP" in k for k in env)
     assert not gate.CASES[0].reuse
+
+
+def test_b8_frontier_is_full_model_and_burst_specific():
+    assert [case.name for case in gate.B8_FRONTIER_CASES] == [
+        "production_burst8",
+        "eager_reuse_burst8",
+        "one_step_graph_burst4",
+        "one_step_graph_burst8",
+        "one_step_graph_burst16",
+        "unrolled_graph8",
+    ]
+    assert [case.burst_steps for case in gate.B8_FRONTIER_CASES] == [
+        8, 8, 4, 8, 16, 8,
+    ]
+    assert gate.B8_FRONTIER_CASES[-1].unroll
+    for case in gate.B8_FRONTIER_CASES:
+        env = gate.case_environment(case)
+        assert env["MEGAGEMM_MULTI_STEP_BURST_BATCH"] == str(case.burst_steps)
+        assert env["MEGAGEMM_BENCHMARK_FORCED_TOKEN_ID"] == "-1"
+
+
+def test_colab_wrapper_selects_b8_batch_and_result_directory():
+    wrapper = (
+        ROOT / "benchmarks" / "run_gemma4_e2b_b1_decode_frontier_colab.sh"
+    ).read_text(encoding="utf-8")
+    assert 'SUITE" == "b8-execution"' in wrapper
+    assert "EFFECTIVE_BATCH_SIZE=8" in wrapper
+    assert "--b8-frontier --skip-python-audit" in wrapper
+    assert "gemma4_e2b_b8_execution_frontier" in wrapper
+
+
+def test_execution_audit_rejects_wrong_burst_size_for_graph():
+    case = gate.B8_FRONTIER_CASES[2]
+    result = graph_row(case)
+    result["scheduler_stats"]["decode_cuda_graphs"]["token_burst_size"] = 8
+    assert gate.audit_execution(case, result, steady=True)
 
 
 def test_promotion_case_removes_experiment_overrides(monkeypatch):
@@ -108,6 +148,7 @@ def graph_row(case):
         multi_step_body=True, persistent_token_feedback_steps=127,
         eager_control=case.eager_control, replays=0 if case.eager_control else 20,
         unrolled_token_burst_steps=119 if case.unroll else 0,
+        token_burst_size=case.burst_steps,
     )
     return r
 

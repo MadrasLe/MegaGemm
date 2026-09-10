@@ -37,6 +37,7 @@ class Case:
     eager_control: bool = False
     unroll: bool = False
     runtime_policy: bool = False
+    burst_steps: int = 8
 
 
 CASES = (
@@ -50,6 +51,20 @@ CASES = (
 PROMOTION_CASES = (
     CASES[0],
     Case("promoted_b4_policy", reuse=True, graph=True, runtime_policy=True),
+)
+
+# B8 has a materially different launch/occupancy balance from B4.  Keep its
+# frontier independent and compare only full-model paths, with one model load.
+# The one-step graph cases vary the number of tokens returned to Python per
+# scheduler iteration; unrolled_graph8 additionally captures all eight
+# dependent model steps into one graph replay.
+B8_FRONTIER_CASES = (
+    Case("production_burst8", burst_steps=8),
+    Case("eager_reuse_burst8", reuse=True, burst_steps=8),
+    Case("one_step_graph_burst4", reuse=True, graph=True, burst_steps=4),
+    Case("one_step_graph_burst8", reuse=True, graph=True, burst_steps=8),
+    Case("one_step_graph_burst16", reuse=True, graph=True, burst_steps=16),
+    Case("unrolled_graph8", reuse=True, graph=True, unroll=True, burst_steps=8),
 )
 
 
@@ -68,7 +83,7 @@ def case_environment(case):
         "MEGAGEMM_DECODE_CUDA_GRAPHS_STABLE_MAX_BLOCKS": "1",
         "MEGAGEMM_DECODE_GRAPH_PERSISTENT_TOKEN_FEEDBACK": "1",
         "MEGAGEMM_DECODE_GRAPH_TOKEN_BURST": "1",
-        "MEGAGEMM_MULTI_STEP_BURST_BATCH": "8",
+        "MEGAGEMM_MULTI_STEP_BURST_BATCH": str(int(case.burst_steps)),
         "MEGAGEMM_GEMMA4_E2B_B1_GRAPH_EXPERIMENT": "1",
         "MEGAGEMM_GEMMA4_E2B_SMALL_BATCH_GRAPH_EXPERIMENT": "1",
         "MEGAGEMM_BENCHMARK_FORCED_TOKEN_ID": "-1",
@@ -172,6 +187,11 @@ def audit_execution(case, row, *, steady):
     if graph.get("native_token_bursts", 0):
         errors.append("unexpected native executor")
     if case.graph:
+        if int(graph.get("token_burst_size", 0) or 0) != int(case.burst_steps):
+            errors.append(
+                f"wrong token burst size: {graph.get('token_burst_size')} "
+                f"!= {case.burst_steps}"
+            )
         if not graph.get("multi_step_body") or not graph.get("persistent_token_feedback_steps", 0):
             errors.append("production multi-step body/token feedback not exercised")
         if bool(graph.get("eager_control")) != case.eager_control:
@@ -301,6 +321,8 @@ def main(argv=None):
                         help="compare five kernel variants, all inside a one-step graph")
     parser.add_argument("--verify-promotion", action="store_true",
                         help="compare eager baseline with the default B4 RuntimePolicy")
+    parser.add_argument("--b8-frontier", action="store_true",
+                        help="compare B8 full-model graph burst sizes 4/8/16")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     if (args.warmups < 1 or args.repeats < 2 or args.max_new_tokens < 32
@@ -308,10 +330,14 @@ def main(argv=None):
         parser.error("requires warmups>=1, repeats>=2, output>=32 and batch in 1,2,4,8")
     if args.kernel_candidates and args.batch_size != 1:
         parser.error("kernel candidates are specialized for batch_size=1")
-    if args.kernel_candidates and args.verify_promotion:
-        parser.error("kernel candidates and promotion verification are separate gates")
+    if sum(bool(value) for value in (
+        args.kernel_candidates, args.verify_promotion, args.b8_frontier
+    )) > 1:
+        parser.error("kernel, promotion, and B8 frontier modes are separate gates")
     if args.verify_promotion and args.batch_size != 4:
         parser.error("the promoted RuntimePolicy is specialized for batch_size=4")
+    if args.b8_frontier and args.batch_size != 8:
+        parser.error("the B8 frontier requires batch_size=8")
     _configure_environment(args.model, -1)
     os.environ.update(case_environment(CASES[0]))
     from benchmarks import benchmark_inference_matrix as matrix
@@ -334,7 +360,11 @@ def main(argv=None):
     cases = (
         experiment.cases
         if experiment
-        else (PROMOTION_CASES if args.verify_promotion else CASES)
+        else (
+            PROMOTION_CASES
+            if args.verify_promotion
+            else (B8_FRONTIER_CASES if args.b8_frontier else CASES)
+        )
     )
     baseline_name = cases[0].name
     tokenizer = matrix.load_tokenizer(args.model)
@@ -348,7 +378,11 @@ def main(argv=None):
     label = (
         "graph kernel"
         if experiment
-        else ("production-policy verification" if args.verify_promotion else "execution-only")
+        else (
+            "production-policy verification"
+            if args.verify_promotion
+            else ("B8 execution frontier" if args.b8_frontier else "execution-only")
+        )
     )
     print(f"E2B/L4/B{args.batch_size} {label} gate: {len(cases)} cases, ONE model load, natural greedy tokens", flush=True)
     print("Cold setup is separate; measured pairs contain no profiler or capture.", flush=True)
@@ -361,7 +395,11 @@ def main(argv=None):
               "metric": "paired (O_long - O1) wall time; separate end-to-end output TPS",
               "source": str(ROOT), "profile": {k: v for k, v in os.environ.items() if k.startswith("MEGAGEMM_")},
               "baseline": baseline_name, "kernel_candidates": bool(experiment),
-              "verify_promotion": bool(args.verify_promotion)}
+              "verify_promotion": bool(args.verify_promotion),
+              "b8_frontier": bool(args.b8_frontier),
+              "case_burst_steps": {
+                  case.name: int(getattr(case, "burst_steps", 8)) for case in cases
+              }}
     def save():
         payload = {"method": method, "cold_setup": cold, "samples": samples, "rejected": rejected,
                    "correctness_failures": correctness, "token_parity": token_parity,
