@@ -105,6 +105,24 @@ SCREEN_CASES = (
     ComputeCase("mlp_fused_both", "mlp", mlp_mode="fused_both"),
 )
 
+
+def select_screen_cases(names: str | None) -> tuple[ComputeCase, ...]:
+    if not names:
+        return SCREEN_CASES
+    by_name = {case.name: case for case in SCREEN_CASES}
+    requested = [item.strip() for item in names.split(",") if item.strip()]
+    unknown = [name for name in requested if name not in by_name]
+    if unknown:
+        raise ValueError("unknown screen case(s): " + ", ".join(unknown))
+    ordered_names = [PRODUCTION.name, *requested]
+    selected: list[ComputeCase] = []
+    seen: set[str] = set()
+    for name in ordered_names:
+        if name not in seen:
+            selected.append(by_name[name])
+            seen.add(name)
+    return tuple(selected)
+
 CONTROLLED_ATTENTION_ENV = (
     "MEGAGEMM_PAGED_DECODE_WARPS_H256",
     "MEGAGEMM_GEMMA4_E2B_L4_H512_ATTN_SEGMENTS",
@@ -501,6 +519,17 @@ def _rotated(cases: tuple[ComputeCase, ...], repeat: int) -> list[ComputeCase]:
     return ordered[offset:] + ordered[:offset]
 
 
+def _discard_case_schedulers(
+    schedulers: dict[tuple[str, str], Any],
+    case: ComputeCase,
+    workloads: tuple[Workload, ...],
+) -> None:
+    for prompt_tokens in {workload.prompt_tokens for workload in workloads}:
+        schedulers.pop((case.name, Workload(prompt_tokens, 1).key), None)
+    for workload in workloads:
+        schedulers.pop((case.name, workload.key), None)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="google/gemma-4-E2B-it")
@@ -509,12 +538,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--maximum-spread", type=float, default=1.08)
     parser.add_argument("--minimum-speedup", type=float, default=1.015)
+    parser.add_argument(
+        "--screen-case-names",
+        help=(
+            "comma-separated subset of screen cases; production is always "
+            "included"
+        ),
+    )
     parser.add_argument("--max-seq-len", type=int, default=2304)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cache-dir")
     args = parser.parse_args(argv)
     if args.screen_repeats < 2 or args.final_repeats < 2 or args.warmups < 1:
         parser.error("screen/final repeats must be >=2 and warmups must be >=1")
+    try:
+        screen_cases = select_screen_cases(args.screen_case_names)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     _configure_environment(args.model, -1)
     import torch
@@ -553,7 +593,11 @@ def main(argv: list[str] | None = None) -> int:
     print("Gemma 4 E2B/L4/B8 full-model compute frontier", flush=True)
     print("  fixed execution: one-step CUDA Graph / scheduler burst 16", flush=True)
     print("  workloads: P512/P2048 x O16/O128", flush=True)
-    print(f"  screen cases: {len(SCREEN_CASES)}", flush=True)
+    print(f"  screen cases: {len(screen_cases)}", flush=True)
+    print(
+        "  selected: " + ", ".join(case.name for case in screen_cases),
+        flush=True,
+    )
     print("  model loads: 1", flush=True)
     print("  tokens: natural greedy; profiler: disabled", flush=True)
 
@@ -608,7 +652,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # Compile/capture outside the measurement region and prove that each case
     # actually selected its requested route.
-    for case in SCREEN_CASES:
+    for case in screen_cases:
+        # References own production graphs too.  Discard every saved owner once
+        # here so setup always performs a fresh capture and the route audit sees
+        # the Python-side kernel selection that graph replay intentionally skips.
+        _discard_case_schedulers(schedulers, case, workloads)
         for workload in workloads:
             short_errors: list[str] = []
             if workload.output_tokens == 16:
@@ -707,15 +755,15 @@ def main(argv: list[str] | None = None) -> int:
                     )
         return rows
 
-    screen_samples = measure(SCREEN_CASES, args.screen_repeats, "screen")
+    screen_samples = measure(screen_cases, args.screen_repeats, "screen")
     screen = summarize_screen(
         screen_samples,
-        SCREEN_CASES,
+        screen_cases,
         workloads,
         repeats=args.screen_repeats,
         maximum_spread=args.maximum_spread,
     )
-    combined = combine_family_winners(SCREEN_CASES, screen["family_winners"])
+    combined = combine_family_winners(screen_cases, screen["family_winners"])
     print(
         "SCREEN WINNERS " + json.dumps(screen["family_winners"], sort_keys=True),
         flush=True,

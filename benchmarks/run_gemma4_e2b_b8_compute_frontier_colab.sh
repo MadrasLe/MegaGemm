@@ -36,11 +36,17 @@ PY
 RUN_ID="${RUN_ID:-gemma4_e2b_b8_compute_frontier_$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT="${OUT:-$REPO/bench_results/gemma4_e2b_b8_compute_frontier/$RUN_ID/decision.json}"
 
+EXTRA_ARGS=()
+if [[ -n "${SCREEN_CASE_NAMES:-}" ]]; then
+  EXTRA_ARGS+=(--screen-case-names "$SCREEN_CASE_NAMES")
+fi
+
 python -u benchmarks/run_gemma4_e2b_b8_compute_frontier.py \
   --model "$MODEL" \
   --screen-repeats "${SCREEN_REPEATS:-2}" \
   --final-repeats "${FINAL_REPEATS:-3}" \
   --warmups "${WARMUPS:-1}" \
-  --output "$OUT"
+  --output "$OUT" \
+  "${EXTRA_ARGS[@]}"
 
 echo "RESULTADO: $OUT"

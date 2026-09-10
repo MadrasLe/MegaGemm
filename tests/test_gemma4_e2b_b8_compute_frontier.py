@@ -64,6 +64,40 @@ def test_compute_frontier_covers_context_and_generation_shapes():
     }
 
 
+def test_targeted_screen_always_includes_production_once():
+    selected = gate.select_screen_cases("lm_head_bn64,production,lm_head_bn64")
+    assert [case.name for case in selected] == ["production", "lm_head_bn64"]
+
+
+def test_targeted_screen_rejects_unknown_case():
+    try:
+        gate.select_screen_cases("not_a_real_case")
+    except ValueError as exc:
+        assert "not_a_real_case" in str(exc)
+    else:
+        raise AssertionError("unknown case was accepted")
+
+
+def test_setup_discards_reference_graphs_before_route_audit():
+    workloads = (
+        gate.Workload(512, 16),
+        gate.Workload(512, 128),
+        gate.Workload(2048, 16),
+        gate.Workload(2048, 128),
+    )
+    schedulers = {
+        ("production", "p512_o1"): object(),
+        ("production", "p512_o16"): object(),
+        ("production", "p512_o128"): object(),
+        ("production", "p2048_o1"): object(),
+        ("production", "p2048_o16"): object(),
+        ("production", "p2048_o128"): object(),
+        ("lm_head_bn64", "p512_o16"): object(),
+    }
+    gate._discard_case_schedulers(schedulers, gate.PRODUCTION, workloads)
+    assert list(schedulers) == [("lm_head_bn64", "p512_o16")]
+
+
 def test_adaptive_attention_changes_only_short_context():
     candidate = next(
         case for case in gate.SCREEN_CASES
@@ -196,3 +230,4 @@ def test_colab_wrapper_uses_drive_without_git_or_vllm():
     assert "vllm" not in wrapper.lower()
     assert "SCREEN_REPEATS" in wrapper
     assert "FINAL_REPEATS" in wrapper
+    assert "SCREEN_CASE_NAMES" in wrapper
