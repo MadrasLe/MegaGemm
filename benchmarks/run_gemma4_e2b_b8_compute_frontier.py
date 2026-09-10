@@ -163,11 +163,27 @@ def _production_mlp_state(model: Any) -> dict[str, Any]:
     return {name: getattr(model, name) for name in names}
 
 
+def _prepare_production_mlp_state(model: Any) -> dict[str, Any]:
+    """Materialize lazy flat-decode policy before recording the baseline."""
+    model._prepare_flat_decode()
+    if not bool(getattr(model, "_flat_decode_ready", False)):
+        raise RuntimeError(
+            "flat decode is not ready: "
+            + str(getattr(model, "_flat_decode_failed_reason", "unknown"))
+        )
+    return _production_mlp_state(model)
+
+
 def _restore_mlp_state(model: Any, state: dict[str, Any]) -> None:
     for name, value in state.items():
         setattr(model, name, value)
-    model._gemma4_flat_fused_gateup_use_cache.clear()
-    model._gemma4_flat_deepfusion_use_cache.clear()
+    for name in (
+        "_gemma4_flat_fused_gateup_use_cache",
+        "_gemma4_flat_deepfusion_use_cache",
+    ):
+        cache = getattr(model, name, None)
+        if cache is not None:
+            cache.clear()
     model._gemma4_flat_fused_gateup_runtime_disabled = False
     model._gemma4_flat_cublaslt_gateup_runtime_disabled = False
     model._gemma4_flat_cublaslt_gateup_failure = ""
@@ -521,7 +537,10 @@ def main(argv: list[str] | None = None) -> int:
     model = engine.model
     if getattr(model.runtime_policy, "name", "") != "gemma4-e2b-l4":
         raise RuntimeError("loaded model did not resolve the E2B/L4 RuntimePolicy")
-    production_mlp_state = _production_mlp_state(model)
+    # Gemma4 creates the decision caches and resolves RuntimePolicy row sets
+    # lazily in _prepare_flat_decode().  Capture only after that initialization;
+    # the constructor's empty tuples are not the production policy.
+    production_mlp_state = _prepare_production_mlp_state(model)
     workloads = tuple(
         Workload(prompt, output)
         for prompt in (512, 2048)

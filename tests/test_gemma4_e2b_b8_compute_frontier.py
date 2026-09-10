@@ -12,6 +12,38 @@ def _sample(case, workload, decode_tps, output_tps, repeat, errors=None):
     }
 
 
+class _LazyFlatModel:
+    def __init__(self):
+        self._flat_decode_ready = False
+        self._flat_decode_failed_reason = ""
+        self._gemma4_flat_policy_fused_gateup_rows = ()
+        self._gemma4_flat_policy_deepfusion_rows = ()
+        self._gemma4_flat_policy_cublas_gateup_rows = ()
+        self._gemma4_flat_policy_cublas_down_rows = ()
+        self._gemma4_flat_cublaslt_gateup_enabled = False
+        self._gemma4_flat_cublaslt_gateup_algorithms = {}
+
+    def _prepare_flat_decode(self):
+        self._flat_decode_ready = True
+        self._gemma4_flat_policy_cublas_gateup_rows = (8,)
+        self._gemma4_flat_fused_gateup_use_cache = {"compiled": True}
+        self._gemma4_flat_deepfusion_use_cache = {"compiled": True}
+
+
+def test_production_mlp_state_is_captured_after_lazy_flat_prepare():
+    model = _LazyFlatModel()
+    state = gate._prepare_production_mlp_state(model)
+    assert state["_gemma4_flat_policy_cublas_gateup_rows"] == (8,)
+    gate._restore_mlp_state(model, state)
+    assert model._gemma4_flat_fused_gateup_use_cache == {}
+    assert model._gemma4_flat_deepfusion_use_cache == {}
+
+
+def test_restore_mlp_state_accepts_unmaterialized_optional_caches():
+    model = _LazyFlatModel()
+    gate._restore_mlp_state(model, gate._production_mlp_state(model))
+
+
 def test_compute_frontier_covers_context_and_generation_shapes():
     workloads = tuple(
         gate.Workload(prompt, output)
