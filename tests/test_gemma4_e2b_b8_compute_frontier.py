@@ -57,7 +57,31 @@ def test_compute_frontier_covers_context_and_generation_shapes():
         "attention",
         "lm_head",
         "mlp",
+        "mlp_core",
+        "ple",
     }
+
+
+def test_mlp_chain_frontier_covers_activation_tensorcore_and_ple_tiles():
+    by_name = {case.name: case for case in gate.SCREEN_CASES}
+    assert {
+        by_name[f"mlp_gated_act_bs{block}"].mlp_activation_block_size
+        for block in (128, 256, 512, 1024)
+    } == {128, 256, 512, 1024}
+    tensorcore = [
+        case for case in gate.SCREEN_CASES
+        if case.mlp_core_mode == "tensorcore_down"
+    ]
+    assert {(case.mlp_tc_block_n, case.mlp_tc_block_k) for case in tensorcore} >= {
+        (32, 32),
+        (64, 32),
+        (128, 32),
+        (64, 64),
+    }
+    assert {
+        by_name[f"ple_conditioned_bs{block}"].ple_block_size
+        for block in (128, 256, 512, 1024)
+    } == {128, 256, 512, 1024}
 
 
 def test_lm_head_frontier_changes_one_dimension_at_a_time():
@@ -232,12 +256,72 @@ def test_screen_selects_family_winners_and_builds_combination():
         "attention": "attention_win",
         "lm_head": "production",
         "mlp": "mlp_win",
+        "mlp_core": "production",
+        "ple": "production",
     }
     combined = gate.combine_family_winners(cases, summary["family_winners"])
     assert combined.h512_short_segments == 8
     assert combined.lm_block_n == 64
     assert combined.lm_triton_reduce is True
     assert combined.mlp_mode == "fused_gateup"
+
+
+def test_combination_propagates_mlp_core_and_ple_winners():
+    mlp_core = gate.ComputeCase(
+        "mlp_core_win",
+        "mlp_core",
+        mlp_core_mode="tensorcore_down",
+        mlp_tc_block_n=128,
+        mlp_tc_block_k=32,
+        mlp_tc_warps=8,
+        mlp_tc_stages=3,
+    )
+    ple = gate.ComputeCase(
+        "ple_win",
+        "ple",
+        ple_conditioned=True,
+        ple_block_size=512,
+    )
+    combined = gate.combine_family_winners(
+        (gate.PRODUCTION, mlp_core, ple),
+        {
+            "attention": "production",
+            "lm_head": "production",
+            "mlp": "production",
+            "mlp_core": "mlp_core_win",
+            "ple": "ple_win",
+        },
+    )
+    assert combined.mlp_core_mode == "tensorcore_down"
+    assert (
+        combined.mlp_tc_block_n,
+        combined.mlp_tc_block_k,
+        combined.mlp_tc_warps,
+        combined.mlp_tc_stages,
+    ) == (128, 32, 8, 3)
+    assert combined.ple_conditioned is True
+    assert combined.ple_block_size == 512
+
+
+def test_mlp_chain_route_audit_rejects_silent_fallback():
+    case = gate.ComputeCase(
+        "tc",
+        "mlp_core",
+        mlp_core_mode="tensorcore_down",
+        mlp_tc_block_n=64,
+        mlp_tc_block_k=32,
+        mlp_tc_warps=4,
+        mlp_tc_stages=2,
+    )
+    delta = {key: 0 for key in gate.COUNTER_KEYS}
+    runtime = {
+        "gemma4_e2b_b8_tensorcore_down_runtime_disabled": True,
+        "gemma4_e2b_b8_tensorcore_down_failure": "compile rejected",
+        "gemma4_e2b_b8_tensorcore_down_config": [64, 32, 4, 2],
+    }
+    errors = gate._route_errors(case, delta, runtime)
+    assert "requested Tensor Core GeGLU+down route produced no hits" in errors
+    assert any("compile rejected" in error for error in errors)
 
 
 def test_combination_propagates_lm_reduction_policy():
@@ -371,3 +455,17 @@ def test_lm_frontier_wrapper_is_drive_native_and_targets_o128_screen():
         "lm_head_torch_reduce",
     ):
         assert name in wrapper
+
+
+def test_mlp_chain_wrapper_is_drive_native_and_full_model():
+    wrapper = (
+        gate.ROOT / "benchmarks" /
+        "run_gemma4_e2b_b8_mlp_chain_frontier_colab.sh"
+    ).read_text(encoding="utf-8")
+    assert "/content/drive/MyDrive/mg/MGRrmsnorm" in wrapper
+    assert "git pull" not in wrapper
+    assert "vllm" not in wrapper.lower()
+    assert "SCREEN_OUTPUT_TOKENS=\"${SCREEN_OUTPUT_TOKENS:-128}\"" in wrapper
+    assert "mlp_gated_act_bs512" in wrapper
+    assert "mlp_tc_bn64_bk32_w4_s2" in wrapper
+    assert "ple_conditioned_bs256" in wrapper

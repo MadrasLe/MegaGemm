@@ -68,6 +68,14 @@ class ComputeCase:
     lm_stages: int = 2
     lm_triton_reduce: bool = True
     mlp_mode: str = "production"
+    mlp_core_mode: str = "production"
+    mlp_activation_block_size: int = 512
+    mlp_tc_block_n: int = 64
+    mlp_tc_block_k: int = 32
+    mlp_tc_warps: int = 4
+    mlp_tc_stages: int = 2
+    ple_conditioned: bool = False
+    ple_block_size: int = 256
 
     def h512_segments(self, prompt_tokens: int) -> int:
         return (
@@ -116,6 +124,92 @@ SCREEN_CASES = (
     ComputeCase("mlp_fused_gateup", "mlp", mlp_mode="fused_gateup"),
     ComputeCase("mlp_deepfusion_down", "mlp", mlp_mode="deepfusion"),
     ComputeCase("mlp_fused_both", "mlp", mlp_mode="fused_both"),
+    # Large dense MLP chain: only the 20 exact I=12288 E2B layers change.
+    ComputeCase(
+        "mlp_gated_act_bs128",
+        "mlp_core",
+        mlp_core_mode="gated_activation",
+        mlp_activation_block_size=128,
+    ),
+    ComputeCase(
+        "mlp_gated_act_bs256",
+        "mlp_core",
+        mlp_core_mode="gated_activation",
+        mlp_activation_block_size=256,
+    ),
+    ComputeCase(
+        "mlp_gated_act_bs512",
+        "mlp_core",
+        mlp_core_mode="gated_activation",
+        mlp_activation_block_size=512,
+    ),
+    ComputeCase(
+        "mlp_gated_act_bs1024",
+        "mlp_core",
+        mlp_core_mode="gated_activation",
+        mlp_activation_block_size=1024,
+    ),
+    ComputeCase(
+        "mlp_tc_bn32_bk32_w4_s2",
+        "mlp_core",
+        mlp_core_mode="tensorcore_down",
+        mlp_tc_block_n=32,
+    ),
+    ComputeCase(
+        "mlp_tc_bn64_bk32_w4_s2",
+        "mlp_core",
+        mlp_core_mode="tensorcore_down",
+    ),
+    ComputeCase(
+        "mlp_tc_bn128_bk32_w4_s2",
+        "mlp_core",
+        mlp_core_mode="tensorcore_down",
+        mlp_tc_block_n=128,
+    ),
+    ComputeCase(
+        "mlp_tc_bn64_bk64_w4_s2",
+        "mlp_core",
+        mlp_core_mode="tensorcore_down",
+        mlp_tc_block_k=64,
+    ),
+    ComputeCase(
+        "mlp_tc_bn64_bk32_w8_s2",
+        "mlp_core",
+        mlp_core_mode="tensorcore_down",
+        mlp_tc_warps=8,
+    ),
+    ComputeCase(
+        "mlp_tc_bn64_bk32_w4_s3",
+        "mlp_core",
+        mlp_core_mode="tensorcore_down",
+        mlp_tc_stages=3,
+    ),
+    # PLE is a separate residual tail, but it belongs in the same full-model
+    # optimization gate because it contributes to every E2B decode layer.
+    ComputeCase(
+        "ple_conditioned_bs128",
+        "ple",
+        ple_conditioned=True,
+        ple_block_size=128,
+    ),
+    ComputeCase(
+        "ple_conditioned_bs256",
+        "ple",
+        ple_conditioned=True,
+        ple_block_size=256,
+    ),
+    ComputeCase(
+        "ple_conditioned_bs512",
+        "ple",
+        ple_conditioned=True,
+        ple_block_size=512,
+    ),
+    ComputeCase(
+        "ple_conditioned_bs1024",
+        "ple",
+        ple_conditioned=True,
+        ple_block_size=1024,
+    ),
 )
 
 FINAL_WORKLOADS = tuple(
@@ -186,6 +280,9 @@ COUNTER_KEYS = (
     "gemma4_flat_deepfusion_hits",
     "gemma4_cublaslt_gateup_decode_hits",
     "fused_rmsnorm_lm_head_argmax_hits",
+    "gemma4_e2b_b8_gated_activation_hits",
+    "gemma4_e2b_b8_tensorcore_down_hits",
+    "gemma4_ple_conditioned_gelu_decode_hits",
 )
 
 
@@ -254,6 +351,15 @@ def _restore_mlp_state(model: Any, state: dict[str, Any]) -> None:
     model._gemma4_flat_fused_gateup_runtime_disabled = False
     model._gemma4_flat_cublaslt_gateup_runtime_disabled = False
     model._gemma4_flat_cublaslt_gateup_failure = ""
+    model._gemma4_flat_b8_gated_activation_enabled = False
+    model._gemma4_flat_b8_gated_activation_runtime_disabled = False
+    model._gemma4_flat_b8_gated_activation_failure = ""
+    model._gemma4_flat_b8_tensorcore_down_enabled = False
+    model._gemma4_flat_b8_tensorcore_down_runtime_disabled = False
+    model._gemma4_flat_b8_tensorcore_down_failure = ""
+    model._gemma4_flat_ple_conditioned_gelu_enabled = False
+    model._gemma4_flat_ple_conditioned_gelu_runtime_disabled = False
+    model._gemma4_flat_ple_conditioned_gelu_first_failure = ""
 
 
 def _apply_case(
@@ -303,6 +409,21 @@ def _apply_case(
     if case.mlp_mode in ("deepfusion", "fused_both"):
         model._gemma4_flat_policy_cublas_down_rows = ()
         model._gemma4_flat_policy_deepfusion_rows = (8,)
+    if case.mlp_core_mode == "gated_activation":
+        model._gemma4_flat_b8_gated_activation_enabled = True
+        model._gemma4_flat_b8_gated_activation_block_size = int(
+            case.mlp_activation_block_size
+        )
+    elif case.mlp_core_mode == "tensorcore_down":
+        model._gemma4_flat_b8_tensorcore_down_enabled = True
+        model._gemma4_flat_b8_tensorcore_down_config = (
+            int(case.mlp_tc_block_n),
+            int(case.mlp_tc_block_k),
+            int(case.mlp_tc_warps),
+            int(case.mlp_tc_stages),
+        )
+    model._gemma4_flat_ple_conditioned_gelu_enabled = bool(case.ple_conditioned)
+    model._gemma4_flat_ple_conditioned_gelu_block_size = int(case.ple_block_size)
 
 
 def _graph_errors(row: dict[str, Any]) -> list[str]:
@@ -351,7 +472,11 @@ def _validate_measurement(
     return errors
 
 
-def _route_errors(case: ComputeCase, delta: dict[str, int]) -> list[str]:
+def _route_errors(
+    case: ComputeCase,
+    delta: dict[str, int],
+    runtime_stats: dict[str, Any],
+) -> list[str]:
     errors: list[str] = []
     if case.mlp_mode in ("fused_gateup", "fused_both") and not delta[
         "gemma4_flat_fused_gateup_hits"
@@ -361,6 +486,46 @@ def _route_errors(case: ComputeCase, delta: dict[str, int]) -> list[str]:
         "gemma4_flat_deepfusion_hits"
     ]:
         errors.append("requested deepfusion down route produced no hits")
+    if case.mlp_core_mode == "gated_activation":
+        if not delta["gemma4_e2b_b8_gated_activation_hits"]:
+            errors.append("requested fused GeGLU activation route produced no hits")
+        if runtime_stats.get("gemma4_e2b_b8_gated_activation_runtime_disabled"):
+            errors.append(
+                "fused GeGLU activation disabled at runtime: "
+                + str(runtime_stats.get("gemma4_e2b_b8_gated_activation_failure"))
+            )
+        if int(
+            runtime_stats.get("gemma4_e2b_b8_gated_activation_block_size") or 0
+        ) != int(case.mlp_activation_block_size):
+            errors.append("fused GeGLU activation selected the wrong block size")
+    if case.mlp_core_mode == "tensorcore_down":
+        if not delta["gemma4_e2b_b8_tensorcore_down_hits"]:
+            errors.append("requested Tensor Core GeGLU+down route produced no hits")
+        if runtime_stats.get("gemma4_e2b_b8_tensorcore_down_runtime_disabled"):
+            errors.append(
+                "Tensor Core GeGLU+down disabled at runtime: "
+                + str(runtime_stats.get("gemma4_e2b_b8_tensorcore_down_failure"))
+            )
+        expected_config = [
+            int(case.mlp_tc_block_n),
+            int(case.mlp_tc_block_k),
+            int(case.mlp_tc_warps),
+            int(case.mlp_tc_stages),
+        ]
+        if runtime_stats.get("gemma4_e2b_b8_tensorcore_down_config") != expected_config:
+            errors.append("Tensor Core GeGLU+down selected the wrong launch config")
+    if case.ple_conditioned:
+        if not delta["gemma4_ple_conditioned_gelu_decode_hits"]:
+            errors.append("requested fused PLE conditioned GELU route produced no hits")
+        if runtime_stats.get("gemma4_ple_conditioned_gelu_runtime_disabled"):
+            errors.append(
+                "fused PLE conditioned GELU disabled at runtime: "
+                + str(runtime_stats.get("gemma4_ple_conditioned_gelu_first_failure"))
+            )
+        if int(runtime_stats.get("gemma4_ple_conditioned_gelu_block_size") or 0) != int(
+            case.ple_block_size
+        ):
+            errors.append("fused PLE conditioned GELU selected the wrong block size")
     return errors
 
 
@@ -481,7 +646,7 @@ def summarize_screen(
         row["worst_output_speedup"] = min(total_speedups, default=0.0)
 
     family_winners: dict[str, str] = {}
-    for family in ("attention", "lm_head", "mlp"):
+    for family in ("attention", "lm_head", "mlp", "mlp_core", "ple"):
         eligible = [
             case
             for case in cases
@@ -515,6 +680,8 @@ def combine_family_winners(
     attention = by_name.get(winners.get("attention", "production"), PRODUCTION)
     lm_head = by_name.get(winners.get("lm_head", "production"), PRODUCTION)
     mlp = by_name.get(winners.get("mlp", "production"), PRODUCTION)
+    mlp_core = by_name.get(winners.get("mlp_core", "production"), PRODUCTION)
+    ple = by_name.get(winners.get("ple", "production"), PRODUCTION)
     combined = replace(
         combined,
         name="best_combination",
@@ -532,6 +699,14 @@ def combine_family_winners(
         lm_stages=lm_head.lm_stages,
         lm_triton_reduce=lm_head.lm_triton_reduce,
         mlp_mode=mlp.mlp_mode,
+        mlp_core_mode=mlp_core.mlp_core_mode,
+        mlp_activation_block_size=mlp_core.mlp_activation_block_size,
+        mlp_tc_block_n=mlp_core.mlp_tc_block_n,
+        mlp_tc_block_k=mlp_core.mlp_tc_block_k,
+        mlp_tc_warps=mlp_core.mlp_tc_warps,
+        mlp_tc_stages=mlp_core.mlp_tc_stages,
+        ple_conditioned=ple.ple_conditioned,
+        ple_block_size=ple.ple_block_size,
     )
     return combined
 
@@ -792,13 +967,14 @@ def main(argv: list[str] | None = None) -> int:
                 for _ in range(args.warmups):
                     row = run_case(case, workload)
                 after = _counter_snapshot(model)
+                steady_runtime = model.decode_runtime_stats()
                 assert row is not None
                 errors = list(short_errors_by_prompt[workload.prompt_tokens])
                 errors.extend(
                     _validate_measurement(row, references[workload.key], workload)
                 )
                 delta = _counter_delta(before, after)
-                errors.extend(_route_errors(case, delta))
+                errors.extend(_route_errors(case, delta, steady_runtime))
                 errors.extend(
                     _attention_route_errors(case, workload, cold_runtime)
                 )
@@ -811,7 +987,7 @@ def main(argv: list[str] | None = None) -> int:
                     "lm_head_runtime_config": lm_runtime,
                     "scheduler_stats": row["scheduler_stats"],
                     "capture_runtime_stats": cold_runtime,
-                    "steady_runtime_stats": model.decode_runtime_stats(),
+                    "steady_runtime_stats": steady_runtime,
                 }
                 checkpoint(
                     stage,

@@ -36,6 +36,8 @@ class RuntimePolicy:
     gemma4_e2b_h512_dense_bridge_pair: bool = False
     gemma4_e2b_b1_dense_bridge: bool = False
     gemma4_ple_conditioned_gelu_decode: bool = False
+    gemma4_e2b_b8_gated_activation_decode: bool = False
+    gemma4_e2b_b8_tensorcore_down_decode: bool = False
     gemma4_e2b_l4_sliding_prefill: bool = False
     gemma4_e2b_l4_full_prefill_expand: bool = False
     gemma4_bf16_fused_gateup_rows: tuple[int, ...] = ()

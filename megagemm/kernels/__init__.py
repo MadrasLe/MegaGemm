@@ -79,12 +79,14 @@ except Exception:
 try:
     from .deepfusion_mlp import (
         deepfusion_swiglu_down,
+        gemma4_e2b_b8_geglu_down_tensorcore,
         deepfusion_mlp_prefers_triton_shape,
         deepfusion_runtime_config,
         HAS_DEEPFUSION_MLP,
     )
 except Exception:
     deepfusion_swiglu_down = None
+    gemma4_e2b_b8_geglu_down_tensorcore = None
     deepfusion_mlp_prefers_triton_shape = None
     deepfusion_runtime_config = None
     HAS_DEEPFUSION_MLP = False
@@ -158,6 +160,7 @@ __all__ = [
     'HAS_RMSNORM_GATED_LINEAR',
     'int8_fused_gemm', 'HAS_INT8_FUSED_GEMM',
     'deepfusion_swiglu_down', 'deepfusion_mlp_prefers_triton_shape',
+    'gemma4_e2b_b8_geglu_down_tensorcore',
     'deepfusion_runtime_config', 'HAS_DEEPFUSION_MLP',
     'fused_rmsnorm_linear', 'fused_rmsnorm_linear_prefers_triton_shape',
     'fused_rmsnorm_linear_runtime_config', 'HAS_FUSED_RMSNORM_LINEAR',

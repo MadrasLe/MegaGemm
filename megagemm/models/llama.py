@@ -172,11 +172,13 @@ try:
     from ..kernels.swiglu import (
         MegaGemmFunction,
         conditioned_gelu_tanh_forward,
+        gated_activation_forward,
         swiglu_forward,
     )
     _HAS_TRITON_SWIGLU = True
 except Exception:
     conditioned_gelu_tanh_forward = None
+    gated_activation_forward = None
     swiglu_forward = None
     _HAS_TRITON_SWIGLU = False
 try:
@@ -196,12 +198,14 @@ except Exception:
 try:
     from ..kernels.deepfusion_mlp import (
         deepfusion_swiglu_down,
+        gemma4_e2b_b8_geglu_down_tensorcore,
         HAS_DEEPFUSION_MLP,
         deepfusion_mlp_prefers_triton_shape,
         deepfusion_runtime_config,
     )
 except Exception:
     deepfusion_swiglu_down = None
+    gemma4_e2b_b8_geglu_down_tensorcore = None
     HAS_DEEPFUSION_MLP = False
     deepfusion_mlp_prefers_triton_shape = None
     deepfusion_runtime_config = None
@@ -10961,6 +10965,18 @@ class MegaGemmLlama(nn.Module):
         )
         self._gemma4_flat_b1_large_gateup_hits = 0
         self._gemma4_flat_b1_large_down_hits = 0
+        self._gemma4_flat_b8_gated_activation_enabled = False
+        self._gemma4_flat_b8_gated_activation_block_size = 512
+        self._gemma4_flat_b8_gated_activation_hits = 0
+        self._gemma4_flat_b8_gated_activation_runtime_disabled = False
+        self._gemma4_flat_b8_gated_activation_failure = ""
+        self._gemma4_flat_b8_gated_activation_bufs = None
+        self._gemma4_flat_b8_tensorcore_down_enabled = False
+        self._gemma4_flat_b8_tensorcore_down_config = (64, 32, 4, 2)
+        self._gemma4_flat_b8_tensorcore_down_hits = 0
+        self._gemma4_flat_b8_tensorcore_down_runtime_disabled = False
+        self._gemma4_flat_b8_tensorcore_down_failure = ""
+        self._gemma4_flat_ple_conditioned_gelu_block_size = 256
         self._gemma4_flat_cublaslt_gateup_enabled = False
         self._gemma4_flat_cublaslt_gateup_hits = 0
         self._gemma4_flat_cublaslt_gateup_runtime_disabled = False
@@ -14152,6 +14168,9 @@ class MegaGemmLlama(nn.Module):
             "gemma4_ple_conditioned_gelu_decode_hits": int(
                 getattr(self, "_gemma4_flat_ple_conditioned_gelu_hits", 0)
             ),
+            "gemma4_ple_conditioned_gelu_block_size": int(
+                getattr(self, "_gemma4_flat_ple_conditioned_gelu_block_size", 0)
+            ),
             "gemma4_ple_conditioned_gelu_runtime_disabled": bool(
                 getattr(
                     self,
@@ -14165,6 +14184,44 @@ class MegaGemmLlama(nn.Module):
                     "_gemma4_flat_ple_conditioned_gelu_first_failure",
                     "",
                 )
+            ),
+            "gemma4_e2b_b8_gated_activation_enabled": bool(
+                getattr(self, "_gemma4_flat_b8_gated_activation_enabled", False)
+            ),
+            "gemma4_e2b_b8_gated_activation_block_size": int(
+                getattr(self, "_gemma4_flat_b8_gated_activation_block_size", 0)
+            ),
+            "gemma4_e2b_b8_gated_activation_hits": int(
+                getattr(self, "_gemma4_flat_b8_gated_activation_hits", 0)
+            ),
+            "gemma4_e2b_b8_gated_activation_runtime_disabled": bool(
+                getattr(
+                    self,
+                    "_gemma4_flat_b8_gated_activation_runtime_disabled",
+                    False,
+                )
+            ),
+            "gemma4_e2b_b8_gated_activation_failure": str(
+                getattr(self, "_gemma4_flat_b8_gated_activation_failure", "")
+            ),
+            "gemma4_e2b_b8_tensorcore_down_enabled": bool(
+                getattr(self, "_gemma4_flat_b8_tensorcore_down_enabled", False)
+            ),
+            "gemma4_e2b_b8_tensorcore_down_config": list(
+                getattr(self, "_gemma4_flat_b8_tensorcore_down_config", ())
+            ),
+            "gemma4_e2b_b8_tensorcore_down_hits": int(
+                getattr(self, "_gemma4_flat_b8_tensorcore_down_hits", 0)
+            ),
+            "gemma4_e2b_b8_tensorcore_down_runtime_disabled": bool(
+                getattr(
+                    self,
+                    "_gemma4_flat_b8_tensorcore_down_runtime_disabled",
+                    False,
+                )
+            ),
+            "gemma4_e2b_b8_tensorcore_down_failure": str(
+                getattr(self, "_gemma4_flat_b8_tensorcore_down_failure", "")
             ),
             "gemma4_flat_deepfusion_hits": int(
                 getattr(self, "_gemma4_flat_deepfusion_hits", 0)
@@ -16498,6 +16555,51 @@ class MegaGemmLlama(nn.Module):
                 and int(self.hidden_size_per_layer_input) == 256
                 and all(int(lw.ple_size) == 256 for lw in weights)
             )
+            self._gemma4_flat_ple_conditioned_gelu_block_size = _env_int(
+                "MEGAGEMM_GEMMA4_PLE_CONDITIONED_GELU_BLOCK_SIZE",
+                256,
+            )
+            b8_large_mlp_supported = bool(
+                self.runtime_policy.name == "gemma4-e2b-l4"
+                and int(batch_size) == 8
+                and dtype == torch.bfloat16
+                and int(self._flat_hidden_size) == 1536
+                and sum(
+                    not lw.is_moe and int(lw.intermediate_size) == 12288
+                    for lw in weights
+                )
+                == 20
+            )
+            self._gemma4_flat_b8_gated_activation_enabled = bool(
+                b8_large_mlp_supported
+                and callable(gated_activation_forward)
+                and policy_bool(
+                    self,
+                    "MEGAGEMM_GEMMA4_E2B_B8_GATED_ACTIVATION_DECODE",
+                    "gemma4_e2b_b8_gated_activation_decode",
+                    default=False,
+                )
+            )
+            self._gemma4_flat_b8_gated_activation_block_size = _env_int(
+                "MEGAGEMM_GEMMA4_E2B_B8_GATED_ACTIVATION_BLOCK_SIZE",
+                512,
+            )
+            self._gemma4_flat_b8_tensorcore_down_enabled = bool(
+                b8_large_mlp_supported
+                and callable(gemma4_e2b_b8_geglu_down_tensorcore)
+                and policy_bool(
+                    self,
+                    "MEGAGEMM_GEMMA4_E2B_B8_TENSORCORE_DOWN_DECODE",
+                    "gemma4_e2b_b8_tensorcore_down_decode",
+                    default=False,
+                )
+            )
+            self._gemma4_flat_b8_tensorcore_down_config = (
+                _env_int("MEGAGEMM_GEMMA4_E2B_B8_TC_DOWN_BLOCK_N", 64),
+                _env_int("MEGAGEMM_GEMMA4_E2B_B8_TC_DOWN_BLOCK_K", 32),
+                _env_int("MEGAGEMM_GEMMA4_E2B_B8_TC_DOWN_WARPS", 4),
+                _env_int("MEGAGEMM_GEMMA4_E2B_B8_TC_DOWN_STAGES", 2),
+            )
             self._gemma4_flat_dense_next_attn_norm_bufs = (
                 [
                     torch.empty(
@@ -16658,6 +16760,12 @@ class MegaGemmLlama(nn.Module):
             self._gemma4_flat_cublaslt_gateup_hits = 0
             self._gemma4_flat_cublaslt_gateup_runtime_disabled = False
             self._gemma4_flat_cublaslt_gateup_failure = ""
+            self._gemma4_flat_b8_gated_activation_hits = 0
+            self._gemma4_flat_b8_gated_activation_runtime_disabled = False
+            self._gemma4_flat_b8_gated_activation_failure = ""
+            self._gemma4_flat_b8_tensorcore_down_hits = 0
+            self._gemma4_flat_b8_tensorcore_down_runtime_disabled = False
+            self._gemma4_flat_b8_tensorcore_down_failure = ""
             self._gemma4_flat_fused_router_expert_input_norm_hits = 0
             if self._gemma4_flat_parallel_moe_enabled:
                 self._gemma4_flat_parallel_moe_stream = torch.cuda.Stream(device=device)
@@ -16681,6 +16789,21 @@ class MegaGemmLlama(nn.Module):
                 if lw.ple_size > 0 else None
                 for lw in weights
             ]
+            self._gemma4_flat_b8_gated_activation_bufs = (
+                [
+                    torch.empty(
+                        batch_size,
+                        lw.intermediate_size,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    if not lw.is_moe and int(lw.intermediate_size) == 12288
+                    else None
+                    for lw in weights
+                ]
+                if b8_large_mlp_supported
+                else None
+            )
             if getattr(self, '_flat_int8_inline', False):
                 max_k = max(
                     self._flat_hidden_size,
@@ -17461,8 +17584,55 @@ class MegaGemmLlama(nn.Module):
         _timing_record_end(timing_events, "mlp_gate_up", mlp_gate_up_start_end)
 
         mlp_down_start_end = _timing_record_start(timing_events is not None)
-        use_deepfusion = not b1_gemv_down and self._gemma4_flat_should_use_deepfusion(
-            gate_up, lw, layer_idx
+        use_tensorcore_down = bool(
+            not b1_gemv_down
+            and getattr(
+                self,
+                "_gemma4_flat_b8_tensorcore_down_enabled",
+                False,
+            )
+            and not getattr(
+                self,
+                "_gemma4_flat_b8_tensorcore_down_runtime_disabled",
+                False,
+            )
+            and callable(gemma4_e2b_b8_geglu_down_tensorcore)
+            and gate_up.dtype == torch.bfloat16
+            and tuple(gate_up.shape) == (8, 24576)
+            and lw.down_weight is not None
+            and tuple(lw.down_weight.shape) == (1536, 12288)
+        )
+        down_out = None
+        if use_tensorcore_down:
+            block_n, block_k, num_warps, num_stages = (
+                self._gemma4_flat_b8_tensorcore_down_config
+            )
+            try:
+                down_out = gemma4_e2b_b8_geglu_down_tensorcore(
+                    gate_up,
+                    lw.down_weight,
+                    lw.down_bias,
+                    out=self._gemma4_flat_down_bufs[layer_idx],
+                    block_n=block_n,
+                    block_k=block_k,
+                    num_warps=num_warps,
+                    num_stages=num_stages,
+                )
+            except Exception as exc:
+                self._gemma4_flat_b8_tensorcore_down_runtime_disabled = True
+                if not self._gemma4_flat_b8_tensorcore_down_failure:
+                    self._gemma4_flat_b8_tensorcore_down_failure = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                use_tensorcore_down = False
+                down_out = None
+            else:
+                self._gemma4_flat_b8_tensorcore_down_hits += 1
+
+        use_deepfusion = bool(
+            not use_tensorcore_down
+            and not b1_gemv_down
+            and self._gemma4_flat_should_use_deepfusion(gate_up, lw, layer_idx)
         )
         if use_deepfusion:
             try:
@@ -17494,14 +17664,55 @@ class MegaGemmLlama(nn.Module):
                     and int(lw.down_weight.shape[0]) == 1536
                 ):
                     self._gemma4_flat_b1_large_down_hits += 1
-        if not use_deepfusion:
-            gate = gate_up[:, :lw.intermediate_size]
-            value = gate_up[:, lw.intermediate_size:]
+        if not use_tensorcore_down and not use_deepfusion:
             mlp_act_start_end = _timing_record_start(timing_events is not None)
-            activated = torch.nn.functional.gelu(gate, approximate='tanh')
-            activated.mul_(value)
+            use_gated_activation = bool(
+                not b1_gemv_down
+                and getattr(
+                    self,
+                    "_gemma4_flat_b8_gated_activation_enabled",
+                    False,
+                )
+                and not getattr(
+                    self,
+                    "_gemma4_flat_b8_gated_activation_runtime_disabled",
+                    False,
+                )
+                and callable(gated_activation_forward)
+                and gate_up.dtype == torch.bfloat16
+                and tuple(gate_up.shape) == (8, 24576)
+                and self._gemma4_flat_b8_gated_activation_bufs is not None
+                and self._gemma4_flat_b8_gated_activation_bufs[layer_idx]
+                is not None
+            )
+            activated = None
+            if use_gated_activation:
+                try:
+                    activated = gated_activation_forward(
+                        gate_up,
+                        lw.intermediate_size,
+                        activation="gelu_tanh",
+                        out=self._gemma4_flat_b8_gated_activation_bufs[layer_idx],
+                        block_size=(
+                            self._gemma4_flat_b8_gated_activation_block_size
+                        ),
+                    )
+                except Exception as exc:
+                    self._gemma4_flat_b8_gated_activation_runtime_disabled = True
+                    if not self._gemma4_flat_b8_gated_activation_failure:
+                        self._gemma4_flat_b8_gated_activation_failure = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    use_gated_activation = False
+                    activated = None
+                else:
+                    self._gemma4_flat_b8_gated_activation_hits += 1
+            if activated is None:
+                gate = gate_up[:, :lw.intermediate_size]
+                value = gate_up[:, lw.intermediate_size:]
+                activated = torch.nn.functional.gelu(gate, approximate='tanh')
+                activated.mul_(value)
             _timing_record_end(timing_events, "mlp_act", mlp_act_start_end)
-            down_out = None
             if gemv_routes is not None and b1_gemv_down:
                 down_out = b1_gemv_down(activated)
             elif b1_gemv_down:
@@ -18260,6 +18471,11 @@ class MegaGemmLlama(nn.Module):
                             ple,
                             ple_condition,
                             out=ple,
+                            block_size=getattr(
+                                self,
+                                "_gemma4_flat_ple_conditioned_gelu_block_size",
+                                256,
+                            ),
                         )
                     except Exception as exc:
                         self._gemma4_flat_ple_conditioned_gelu_runtime_disabled = True

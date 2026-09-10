@@ -280,6 +280,81 @@ if _HAS_TRITON:
         tl.store(y_ptrs, acc.to(y_ptr.dtype.element_ty), mask=n_mask)
 
 
+    @triton.jit
+    def _gemma4_e2b_b8_geglu_down_tensorcore_kernel(
+        gate_up_ptr,  # [8, 24576]
+        w_ptr,        # [1536, 12288]
+        b_ptr,        # [1536] or dummy
+        y_ptr,        # [8, 1536]
+        stride_xm,
+        stride_xk,
+        stride_wn,
+        stride_wk,
+        stride_ym,
+        stride_yn,
+        I: tl.constexpr,
+        H: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """Exact B8 Gemma 4 E2B GeGLU+down Tensor Core tile.
+
+        BLOCK_M is deliberately fixed at 16: Ampere/Ada Tensor Cores require a
+        matrix tile even though only eight rows are live.  The two BF16 casts
+        reproduce PyTorch's materialized GELU and multiply boundaries before
+        the FP32-accumulating down projection.
+        """
+        block_m: tl.constexpr = 16
+        offs_m = tl.arange(0, block_m)
+        offs_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+        m_mask = offs_m < 8
+        n_mask = offs_n < H
+        acc = tl.zeros((block_m, BLOCK_N), dtype=tl.float32)
+
+        for k_start in range(0, I, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            gate = tl.load(
+                gate_up_ptr
+                + offs_m[:, None] * stride_xm
+                + offs_k[None, :] * stride_xk,
+                mask=m_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            up = tl.load(
+                gate_up_ptr
+                + offs_m[:, None] * stride_xm
+                + (offs_k + I)[None, :] * stride_xk,
+                mask=m_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            inner = 0.7978845608028654 * (
+                gate + 0.044715 * gate * gate * gate
+            )
+            gelu_bf16 = (gate * tl.sigmoid(2.0 * inner)).to(tl.bfloat16)
+            activated = (gelu_bf16.to(tl.float32) * up).to(tl.bfloat16)
+            weight = tl.load(
+                w_ptr
+                + offs_k[:, None] * stride_wk
+                + offs_n[None, :] * stride_wn,
+                mask=n_mask[None, :],
+                other=0.0,
+            )
+            acc += tl.dot(activated, weight)
+
+        if HAS_BIAS:
+            bias = tl.load(b_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+            acc += bias[None, :]
+
+        tl.store(
+            y_ptr
+            + offs_m[:, None] * stride_ym
+            + offs_n[None, :] * stride_yn,
+            acc,
+            mask=m_mask[:, None] & n_mask[None, :],
+        )
+
+
 def _pick_cfg(i_dim: int, h_dim: int, rows: int):
     if _CFG_FORCED_BN > 0 and _CFG_FORCED_BK > 0 and _CFG_FORCED_WARPS > 0:
         return _CFG_FORCED_BN, _CFG_FORCED_BK, _CFG_FORCED_WARPS, max(1, _CFG_FORCED_STAGES or 2)
@@ -484,6 +559,86 @@ def deepfusion_swiglu_down(
     return out_2d.view(*orig_shape[:-1], h_dim)
 
 
+def gemma4_e2b_b8_geglu_down_tensorcore(
+    gate_up: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_bias: Optional[torch.Tensor] = None,
+    *,
+    out: torch.Tensor,
+    block_n: int = 64,
+    block_k: int = 32,
+    num_warps: int = 4,
+    num_stages: int = 2,
+) -> torch.Tensor:
+    """Fused Tensor Core GeGLU+down for the exact E2B/L4/B8 large MLP.
+
+    This deliberately has no generic fallback.  Callers must treat rejection
+    as an experimental-route failure and retain the existing cuBLAS chain.
+    """
+    if not _HAS_TRITON:
+        raise RuntimeError("Triton is unavailable")
+    if torch.is_grad_enabled():
+        raise ValueError("Gemma4 E2B B8 Tensor Core MLP requires inference mode")
+    if not gate_up.is_cuda or not down_weight.is_cuda or not out.is_cuda:
+        raise ValueError("Gemma4 E2B B8 Tensor Core MLP requires CUDA tensors")
+    if gate_up.dtype != torch.bfloat16 or down_weight.dtype != torch.bfloat16:
+        raise ValueError("Gemma4 E2B B8 Tensor Core MLP requires BF16 inputs")
+    if out.dtype != gate_up.dtype or out.device != gate_up.device:
+        raise ValueError("out must match gate_up device and dtype")
+    if down_weight.device != gate_up.device:
+        raise ValueError("gate_up and down_weight must use the same device")
+    if tuple(gate_up.shape) != (8, 24576):
+        raise ValueError(
+            f"gate_up shape must be (8, 24576), got {tuple(gate_up.shape)}"
+        )
+    if tuple(down_weight.shape) != (1536, 12288):
+        raise ValueError(
+            "down_weight shape must be (1536, 12288), got "
+            f"{tuple(down_weight.shape)}"
+        )
+    if tuple(out.shape) != (8, 1536):
+        raise ValueError(f"out shape must be (8, 1536), got {tuple(out.shape)}")
+    if gate_up.stride(1) != 1 or down_weight.stride(1) != 1 or out.stride(1) != 1:
+        raise ValueError("all tensors must have a contiguous last dimension")
+    if down_bias is not None:
+        if tuple(down_bias.shape) != (1536,):
+            raise ValueError("down_bias shape must be (1536,)")
+        if down_bias.device != gate_up.device or down_bias.dtype != gate_up.dtype:
+            raise ValueError("down_bias must match gate_up device and dtype")
+    if block_n not in (32, 64, 128):
+        raise ValueError("block_n must be one of 32, 64, 128")
+    if block_k not in (32, 64):
+        raise ValueError("block_k must be one of 32, 64")
+    if num_warps not in (4, 8):
+        raise ValueError("num_warps must be 4 or 8")
+    if num_stages not in (2, 3):
+        raise ValueError("num_stages must be 2 or 3")
+
+    bias_ptr = down_bias if down_bias is not None else gate_up
+    _gemma4_e2b_b8_geglu_down_tensorcore_kernel[
+        (triton.cdiv(1536, block_n),)
+    ](
+        gate_up,
+        down_weight,
+        bias_ptr,
+        out,
+        int(gate_up.stride(0)),
+        int(gate_up.stride(1)),
+        int(down_weight.stride(0)),
+        int(down_weight.stride(1)),
+        int(out.stride(0)),
+        int(out.stride(1)),
+        I=12288,
+        H=1536,
+        HAS_BIAS=down_bias is not None,
+        BLOCK_N=int(block_n),
+        BLOCK_K=int(block_k),
+        num_warps=int(num_warps),
+        num_stages=int(num_stages),
+    )
+    return out
+
+
 HAS_DEEPFUSION_MLP = _HAS_TRITON
 
 
@@ -513,6 +668,7 @@ def deepfusion_runtime_config() -> dict:
 
 __all__ = [
     "deepfusion_swiglu_down",
+    "gemma4_e2b_b8_geglu_down_tensorcore",
     "deepfusion_mlp_prefers_triton_shape",
     "deepfusion_runtime_config",
     "HAS_DEEPFUSION_MLP",
