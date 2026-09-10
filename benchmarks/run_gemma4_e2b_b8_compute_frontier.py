@@ -476,6 +476,19 @@ def final_decision(
     policy_changed: bool = True,
 ) -> dict[str, Any]:
     production = summary["cases"].get("production") or {}
+    if not policy_changed:
+        valid = bool(production.get("valid"))
+        return {
+            "decision": "KEEP_PRODUCTION",
+            "apply_change": False,
+            "valid": valid,
+            "geomean_decode_speedup": 1.0,
+            "geomean_output_speedup": 1.0,
+            "worst_decode_speedup": 1.0,
+            "worst_output_speedup": 1.0,
+            "minimum_speedup": minimum_speedup,
+            "policy_changed": False,
+        }
     candidate = summary["cases"].get("best_combination") or {}
     valid = bool(production.get("valid") and candidate.get("valid"))
     decode_speedup = float(candidate.get("geomean_decode_speedup") or 0.0)
@@ -772,7 +785,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # Capture the combination and a fresh production graph for a final paired
     # A/B.  They remain in the same process and on the same loaded model.
-    final_cases = (PRODUCTION, combined)
+    policy_changed = changes_compute_policy(combined)
+    # If every family lost the screen, a second copy of production cannot add
+    # evidence.  Measure production once in the final phase and exit cleanly.
+    final_cases = (PRODUCTION, combined) if policy_changed else (PRODUCTION,)
     for case in final_cases:
         for workload in workloads:
             schedulers.pop((case.name, workload.key), None)
@@ -824,7 +840,7 @@ def main(argv: list[str] | None = None) -> int:
         final_summary,
         minimum_speedup=args.minimum_speedup,
         maximum_spread=args.maximum_spread,
-        policy_changed=changes_compute_policy(combined),
+        policy_changed=policy_changed,
     )
     excluded = {
         "cublaslt_gateup": (

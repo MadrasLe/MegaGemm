@@ -220,6 +220,24 @@ def test_identical_combination_cannot_be_promoted_from_noise():
     ) is False
 
 
+def test_unchanged_final_ignores_duplicate_candidate_noise():
+    summary = {
+        "cases": {
+            "production": {"valid": True},
+            "best_combination": {"valid": False},
+        }
+    }
+    decision = gate.final_decision(
+        summary,
+        minimum_speedup=1.015,
+        maximum_spread=1.08,
+        policy_changed=False,
+    )
+    assert decision["decision"] == "KEEP_PRODUCTION"
+    assert decision["valid"] is True
+    assert decision["geomean_decode_speedup"] == 1.0
+
+
 def test_colab_wrapper_uses_drive_without_git_or_vllm():
     wrapper = (
         gate.ROOT / "benchmarks" /
