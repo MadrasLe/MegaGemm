@@ -448,6 +448,9 @@ def _validate_measurement(
     row: dict[str, Any],
     reference: dict[str, Any],
     workload: Workload,
+    *,
+    require_token_match: bool = True,
+    reference_label: str = "production",
 ) -> list[str]:
     errors: list[str] = []
     expected = 8 * workload.output_tokens
@@ -458,9 +461,9 @@ def _validate_measurement(
     if row.get("lengths") != [workload.output_tokens] * 8:
         errors.append("per-request output lengths differ from the workload")
     token_comparison = compare_generated_tokens(row, reference)
-    if not token_comparison["exact_match"]:
+    if require_token_match and not token_comparison["exact_match"]:
         errors.append(
-            "natural greedy tokens differ from production: "
+            f"natural greedy tokens differ from {reference_label}: "
             f"agreement={token_comparison['token_agreement']:.6f} "
             f"first={token_comparison['first_divergence']}"
         )
@@ -475,6 +478,205 @@ def _validate_measurement(
     if workload.output_tokens > 1:
         errors.extend(_graph_errors(row))
     return errors
+
+
+def _allows_numerically_valid_token_divergence(case: ComputeCase) -> bool:
+    """Whether a case may use its own deterministic natural-token stream.
+
+    The Tensor Core down projection changes the legal floating-point reduction
+    order relative to cuBLAS.  A near-tie in the LM head can therefore choose a
+    different natural token even when the layer output is numerically valid.
+    Such a case must pass the real-weight tensor preflight below and remain
+    bit-exact with itself; the production-token comparison is still recorded.
+    """
+    return case.mlp_core_mode == "tensorcore_down"
+
+
+def _tensorcore_preflight_passes(
+    metrics: dict[str, Any],
+    *,
+    min_cosine: float,
+    max_relative_l2: float,
+    max_relative_linf: float,
+) -> bool:
+    return bool(
+        metrics.get("finite")
+        and metrics.get("repeat_exact")
+        and float(metrics.get("cosine") or 0.0) >= min_cosine
+        and float(metrics.get("relative_l2_error", float("inf")))
+        <= max_relative_l2
+        and float(metrics.get("relative_linf_error", float("inf")))
+        <= max_relative_linf
+    )
+
+
+def _capture_tensorcore_preflight_fixtures(model: Any) -> list[dict[str, Any]]:
+    """Capture actual decode activations and weights from every target layer.
+
+    This runs after the production references, so the gate-up buffers contain
+    real E2B decode activations rather than synthetic random tensors.  Tensor
+    objects remain private to the process; only scalar diagnostics reach JSON.
+    """
+    import torch
+    import torch.nn.functional as functional
+
+    weights = list(getattr(model, "_flat_layer_weights", ()) or ())
+    gate_up_buffers = list(getattr(model, "_gemma4_flat_gate_up_bufs", ()) or ())
+    eligible = [
+        index
+        for index, layer in enumerate(weights)
+        if not bool(getattr(layer, "is_moe", False))
+        and int(getattr(layer, "intermediate_size", 0)) == 12288
+        and getattr(layer, "down_weight", None) is not None
+        and getattr(layer, "down_wt", None) is not None
+        and index < len(gate_up_buffers)
+        and tuple(gate_up_buffers[index].shape) == (8, 24576)
+        and tuple(layer.down_weight.shape) == (1536, 12288)
+    ]
+    if not eligible:
+        raise RuntimeError(
+            "no real E2B B8 1536->24576->1536 layer was available for the "
+            "Tensor Core numeric preflight"
+        )
+    fixtures: list[dict[str, Any]] = []
+    with torch.inference_mode():
+        for layer_index in eligible:
+            layer = weights[layer_index]
+            gate_up = gate_up_buffers[layer_index].detach().clone()
+            gate = gate_up[:, :12288]
+            value = gate_up[:, 12288:]
+            activated = functional.gelu(gate, approximate="tanh")
+            activated.mul_(value)
+            reference = torch.empty(
+                (8, 1536),
+                device=gate_up.device,
+                dtype=gate_up.dtype,
+            )
+            torch.mm(activated, layer.down_wt, out=reference)
+            if layer.down_bias is not None:
+                reference.add_(layer.down_bias)
+            fixtures.append(
+                {
+                    "layer_index": int(layer_index),
+                    "gate_up": gate_up,
+                    "down_weight": layer.down_weight,
+                    "down_bias": layer.down_bias,
+                    "reference": reference.clone(),
+                }
+            )
+        torch.cuda.synchronize()
+    return fixtures
+
+
+def _run_tensorcore_numeric_preflight(
+    case: ComputeCase,
+    fixtures: list[dict[str, Any]],
+    *,
+    min_cosine: float,
+    max_relative_l2: float,
+    max_relative_linf: float,
+) -> dict[str, Any]:
+    """Validate one Tensor Core tile on real E2B activations and weights."""
+    import torch
+    import torch.nn.functional as functional
+    from megagemm.kernels.deepfusion_mlp import (
+        gemma4_e2b_b8_geglu_down_tensorcore,
+    )
+
+    config = {
+        "block_n": int(case.mlp_tc_block_n),
+        "block_k": int(case.mlp_tc_block_k),
+        "num_warps": int(case.mlp_tc_warps),
+        "num_stages": int(case.mlp_tc_stages),
+    }
+    rows: list[dict[str, Any]] = []
+    with torch.inference_mode():
+        for fixture in fixtures:
+            first = torch.empty_like(fixture["reference"])
+            second = torch.empty_like(first)
+            gemma4_e2b_b8_geglu_down_tensorcore(
+                fixture["gate_up"],
+                fixture["down_weight"],
+                fixture["down_bias"],
+                out=first,
+                **config,
+            )
+            gemma4_e2b_b8_geglu_down_tensorcore(
+                fixture["gate_up"],
+                fixture["down_weight"],
+                fixture["down_bias"],
+                out=second,
+                **config,
+            )
+            torch.cuda.synchronize()
+            candidate_fp32 = first.float()
+            reference_fp32 = fixture["reference"].float()
+            delta = candidate_fp32 - reference_fp32
+            reference_l2 = float(torch.linalg.vector_norm(reference_fp32).item())
+            reference_linf = float(reference_fp32.abs().max().item())
+            delta_l2 = float(torch.linalg.vector_norm(delta).item())
+            max_abs = float(delta.abs().max().item())
+            metrics = {
+                "layer_index": int(fixture["layer_index"]),
+                "finite": bool(torch.isfinite(first).all().item()),
+                "repeat_exact": bool(torch.equal(first, second)),
+                "max_abs_error": max_abs,
+                "mean_abs_error": float(delta.abs().mean().item()),
+                "relative_l2_error": delta_l2 / max(reference_l2, 1.0e-12),
+                "relative_linf_error": max_abs / max(reference_linf, 1.0e-12),
+                "cosine": float(
+                    functional.cosine_similarity(
+                        candidate_fp32.flatten(),
+                        reference_fp32.flatten(),
+                        dim=0,
+                    ).item()
+                ),
+                "reference_max_abs": reference_linf,
+                "gate_up_max_abs": float(fixture["gate_up"].abs().max().item()),
+            }
+            metrics["passed"] = _tensorcore_preflight_passes(
+                metrics,
+                min_cosine=min_cosine,
+                max_relative_l2=max_relative_l2,
+                max_relative_linf=max_relative_linf,
+            )
+            rows.append(metrics)
+    summary = {
+        "layer_count": len(rows),
+        "minimum_cosine": min((row["cosine"] for row in rows), default=0.0),
+        "maximum_relative_l2": max(
+            (row["relative_l2_error"] for row in rows),
+            default=float("inf"),
+        ),
+        "maximum_relative_linf": max(
+            (row["relative_linf_error"] for row in rows),
+            default=float("inf"),
+        ),
+        "maximum_absolute_error": max(
+            (row["max_abs_error"] for row in rows),
+            default=float("inf"),
+        ),
+        "all_repeat_exact": bool(
+            rows and all(row["repeat_exact"] for row in rows)
+        ),
+    }
+    return {
+        "applicable": True,
+        "source": (
+            "actual production decode gate-up buffers and model weights for "
+            "every exact-shape dense E2B layer"
+        ),
+        "config": config,
+        "thresholds": {
+            "min_cosine": min_cosine,
+            "max_relative_l2": max_relative_l2,
+            "max_relative_linf": max_relative_linf,
+            "repeat_exact_required": True,
+        },
+        "summary": summary,
+        "layers": rows,
+        "passed": bool(rows and all(row["passed"] for row in rows)),
+    }
 
 
 def _route_errors(
@@ -805,6 +1007,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--maximum-spread", type=float, default=1.08)
     parser.add_argument("--minimum-speedup", type=float, default=1.015)
     parser.add_argument("--minimum-output-speedup", type=float, default=1.0)
+    parser.add_argument("--tensorcore-min-cosine", type=float, default=0.9999)
+    parser.add_argument("--tensorcore-max-relative-l2", type=float, default=0.01)
+    parser.add_argument("--tensorcore-max-relative-linf", type=float, default=0.05)
     parser.add_argument(
         "--screen-case-names",
         help=(
@@ -886,6 +1091,8 @@ def main(argv: list[str] | None = None) -> int:
     schedulers: dict[tuple[str, str], Any] = {}
     references: dict[str, dict[str, Any]] = {}
     short_references: dict[int, dict[str, Any]] = {}
+    case_references: dict[str, dict[str, Any]] = {}
+    tensorcore_preflights: dict[str, dict[str, Any]] = {}
     setup_audits: dict[str, Any] = {}
     phase_samples: dict[str, list[dict[str, Any]]] = {
         "screen": [],
@@ -901,6 +1108,7 @@ def main(argv: list[str] | None = None) -> int:
             "status": "running",
             "stage": stage,
             "model_loads": 1,
+            "tensorcore_numeric_preflights": tensorcore_preflights,
             "setup_audits": setup_audits,
             "screen_samples": phase_samples["screen"],
             "final_samples": phase_samples["final"],
@@ -930,6 +1138,48 @@ def main(argv: list[str] | None = None) -> int:
                 f"{workload.key}: effective prompt plus output exceeds max sequence "
                 f"length ({effective}+{workload.output_tokens}>{args.max_seq_len})"
             )
+
+    def tensorcore_key(case: ComputeCase) -> str:
+        return (
+            f"bn{case.mlp_tc_block_n}_bk{case.mlp_tc_block_k}_"
+            f"w{case.mlp_tc_warps}_s{case.mlp_tc_stages}"
+        )
+
+    tensorcore_cases = tuple(
+        case
+        for case in screen_cases
+        if _allows_numerically_valid_token_divergence(case)
+    )
+    tensorcore_fixtures = (
+        _capture_tensorcore_preflight_fixtures(model)
+        if tensorcore_cases
+        else []
+    )
+
+    def tensorcore_preflight(case: ComputeCase) -> dict[str, Any] | None:
+        if not _allows_numerically_valid_token_divergence(case):
+            return None
+        key = tensorcore_key(case)
+        if key not in tensorcore_preflights:
+            tensorcore_preflights[key] = _run_tensorcore_numeric_preflight(
+                case,
+                tensorcore_fixtures,
+                min_cosine=args.tensorcore_min_cosine,
+                max_relative_l2=args.tensorcore_max_relative_l2,
+                max_relative_linf=args.tensorcore_max_relative_linf,
+            )
+            result = tensorcore_preflights[key]
+            print(
+                "TENSORCORE NUMERIC PREFLIGHT "
+                + key
+                + f" passed={result['passed']} "
+                + json.dumps(result["summary"], sort_keys=True),
+                flush=True,
+            )
+        return tensorcore_preflights[key]
+
+    for case in tensorcore_cases:
+        tensorcore_preflight(case)
     checkpoint("references_complete")
 
     def setup_cases(
@@ -946,27 +1196,59 @@ def main(argv: list[str] | None = None) -> int:
             # Reference and previous-phase schedulers may own graphs for the
             # same logical case. A phase gets fresh, explicitly audited owners.
             _discard_case_schedulers(schedulers, case, phase_workloads)
+            numeric_preflight = tensorcore_preflight(case)
+            allow_production_token_divergence = bool(
+                numeric_preflight is not None and numeric_preflight.get("passed")
+            )
+            numeric_errors = []
+            if (
+                _allows_numerically_valid_token_divergence(case)
+                and not allow_production_token_divergence
+            ):
+                numeric_errors.append(
+                    "Tensor Core real-weight numeric preflight failed"
+                )
             short_errors_by_prompt: dict[int, list[str]] = {}
+            short_comparisons_by_prompt: dict[int, dict[str, Any]] = {}
             for prompt_tokens in sorted(
                 {workload.prompt_tokens for workload in phase_workloads}
             ):
                 short_workload = Workload(prompt_tokens, 1)
-                run_case(case, short_workload)
+                short_cold = run_case(case, short_workload)
                 short_row = None
                 for _ in range(args.warmups):
                     short_row = run_case(case, short_workload)
                 assert short_row is not None
-                short_errors_by_prompt[prompt_tokens] = _validate_measurement(
+                errors = list(numeric_errors)
+                errors.extend(_validate_measurement(
                     short_row,
                     short_references[prompt_tokens],
                     short_workload,
+                    require_token_match=not allow_production_token_divergence,
+                ))
+                repeat_comparison = compare_generated_tokens(short_row, short_cold)
+                if not repeat_comparison["exact_match"]:
+                    errors.append(
+                        "candidate natural tokens are not repeat-deterministic: "
+                        f"agreement={repeat_comparison['token_agreement']:.6f} "
+                        f"first={repeat_comparison['first_divergence']}"
+                    )
+                short_errors_by_prompt[prompt_tokens] = errors
+                short_comparisons_by_prompt[prompt_tokens] = (
+                    compare_generated_tokens(
+                        short_row,
+                        short_references[prompt_tokens],
+                    )
                 )
+                case_references[
+                    f"{audit_prefix}{case.name}/{short_workload.key}"
+                ] = short_row
 
             for workload in phase_workloads:
                 before = _counter_snapshot(model)
                 # First call owns compilation/capture; following calls prove
                 # steady reuse. Neither is admitted into measured samples.
-                run_case(case, workload)
+                cold_row = run_case(case, workload)
                 cold_runtime = model.decode_runtime_stats()
                 row = None
                 for _ in range(args.warmups):
@@ -976,8 +1258,20 @@ def main(argv: list[str] | None = None) -> int:
                 assert row is not None
                 errors = list(short_errors_by_prompt[workload.prompt_tokens])
                 errors.extend(
-                    _validate_measurement(row, references[workload.key], workload)
+                    _validate_measurement(
+                        row,
+                        references[workload.key],
+                        workload,
+                        require_token_match=not allow_production_token_divergence,
+                    )
                 )
+                repeat_comparison = compare_generated_tokens(row, cold_row)
+                if not repeat_comparison["exact_match"]:
+                    errors.append(
+                        "candidate natural tokens are not repeat-deterministic: "
+                        f"agreement={repeat_comparison['token_agreement']:.6f} "
+                        f"first={repeat_comparison['first_divergence']}"
+                    )
                 delta = _counter_delta(before, after)
                 errors.extend(_route_errors(case, delta, steady_runtime))
                 errors.extend(
@@ -986,8 +1280,21 @@ def main(argv: list[str] | None = None) -> int:
                 errors.extend(_lm_route_errors(case, lm_kernel))
                 lm_runtime = lm_kernel.lm_head_argmax_runtime_config()
                 audit_key = f"{audit_prefix}{case.name}/{workload.key}"
+                production_comparison = compare_generated_tokens(
+                    row,
+                    references[workload.key],
+                )
+                case_references[audit_key] = row
                 setup_audits[audit_key] = {
                     "errors": errors,
+                    "tensorcore_numeric_preflight_key": (
+                        tensorcore_key(case) if numeric_preflight is not None else None
+                    ),
+                    "production_token_comparison": production_comparison,
+                    "candidate_repeat_comparison": repeat_comparison,
+                    "short_production_token_comparison": (
+                        short_comparisons_by_prompt[workload.prompt_tokens]
+                    ),
                     "counter_delta": delta,
                     "lm_head_runtime_config": lm_runtime,
                     "scheduler_stats": row["scheduler_stats"],
@@ -1035,18 +1342,33 @@ def main(argv: list[str] | None = None) -> int:
                     short_workload = Workload(workload.prompt_tokens, 1)
                     short = run_case(case, short_workload)
                     long = run_case(case, workload)
+                    reference_prefix = "final/" if phase == "final" else ""
+                    own_short_reference = case_references[
+                        f"{reference_prefix}{case.name}/{short_workload.key}"
+                    ]
+                    own_long_reference = case_references[
+                        f"{reference_prefix}{case.name}/{workload.key}"
+                    ]
                     errors = _validate_measurement(
                         short,
-                        short_references[workload.prompt_tokens],
+                        own_short_reference,
                         short_workload,
+                        reference_label="the same candidate setup",
                     )
                     errors += _validate_measurement(
-                        long, references[workload.key], workload
+                        long,
+                        own_long_reference,
+                        workload,
+                        reference_label="the same candidate setup",
                     )
                     decode_s = float(long["elapsed_s"]) - float(short["elapsed_s"])
                     if decode_s <= 0.0 or not math.isfinite(decode_s):
                         errors.append("paired incremental decode time is not positive")
                     decode_tokens = 8 * (workload.output_tokens - 1)
+                    production_token_comparison = compare_generated_tokens(
+                        long,
+                        references[workload.key],
+                    )
                     result = {
                         "phase": phase,
                         "repeat": repeat + 1,
@@ -1057,6 +1379,7 @@ def main(argv: list[str] | None = None) -> int:
                         "output_tps": float(long["output_tps"]),
                         "short": short,
                         "long": long,
+                        "production_token_comparison": production_token_comparison,
                         "errors": errors,
                     }
                     rows.append(result)
@@ -1067,6 +1390,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(
                         f"{phase} {case.name} {workload.key} {repeat + 1}/{repeats}: "
                         f"decode={result['decode_tps']:.2f} total={result['output_tps']:.2f} "
+                        f"prod_tokens={production_token_comparison['token_agreement']:.6f} "
                         f"errors={errors}",
                         flush=True,
                     )
@@ -1151,6 +1475,11 @@ def main(argv: list[str] | None = None) -> int:
             "dtype": "bf16",
             "execution": "default E2B/L4 B8 RuntimePolicy graph burst16",
             "natural_greedy_tokens": True,
+            "token_validation": (
+                "production-exact for ordinary candidates; Tensor Core candidates "
+                "must pass real-weight numeric tolerances and remain bit-exact "
+                "with themselves while production divergence is reported"
+            ),
             "profiler_in_timing": False,
             "screen_workloads": [
                 asdict(workload) for workload in screen_workloads
@@ -1165,6 +1494,7 @@ def main(argv: list[str] | None = None) -> int:
         "final": final_summary,
         "final_samples": final_samples,
         "decision": decision,
+        "tensorcore_numeric_preflights": tensorcore_preflights,
         "setup_audits": setup_audits,
         "excluded_by_existing_evidence": excluded,
     }

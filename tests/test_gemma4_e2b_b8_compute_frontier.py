@@ -352,6 +352,80 @@ def test_measurement_reports_first_natural_token_divergence():
     assert any("'token_index': 1" in error for error in errors)
 
 
+def test_tensorcore_measurement_can_report_without_rejecting_production_divergence():
+    workload = gate.Workload(512, 2)
+    reference = {
+        "generated_tokens": 16,
+        "lengths": [2] * 8,
+        "generated_ids": [[1, 2]] * 8,
+        "digest": "reference",
+        "engine_prompt_lengths": [512] * 8,
+        "elapsed_s": 1.0,
+        "scheduler_stats": {
+            "benchmark_forced_token_id": -1,
+            "decode_cuda_graphs": {
+                "enabled": True,
+                "token_burst_size": 16,
+                "replays": 1,
+                "request_scheduler_reused": True,
+                "failures": 0,
+            },
+        },
+    }
+    candidate = dict(reference)
+    candidate["generated_ids"] = [[1, 3], *([[1, 2]] * 7)]
+    candidate["digest"] = "candidate"
+    errors = gate._validate_measurement(
+        candidate,
+        reference,
+        workload,
+        require_token_match=False,
+    )
+    assert errors == []
+    comparison = gate.compare_generated_tokens(candidate, reference)
+    assert comparison["exact_match"] is False
+    assert comparison["first_divergence"]["token_index"] == 1
+
+
+def test_only_tensorcore_route_can_use_numerically_valid_token_stream():
+    tensorcore = gate.ComputeCase(
+        "tc",
+        "mlp_core",
+        mlp_core_mode="tensorcore_down",
+    )
+    gated = gate.ComputeCase(
+        "gated",
+        "mlp_core",
+        mlp_core_mode="gated_activation",
+    )
+    assert gate._allows_numerically_valid_token_divergence(tensorcore) is True
+    assert gate._allows_numerically_valid_token_divergence(gated) is False
+
+
+def test_tensorcore_preflight_requires_accuracy_and_self_determinism():
+    valid = {
+        "finite": True,
+        "repeat_exact": True,
+        "cosine": 0.99999,
+        "relative_l2_error": 0.001,
+        "relative_linf_error": 0.01,
+    }
+    limits = {
+        "min_cosine": 0.9999,
+        "max_relative_l2": 0.01,
+        "max_relative_linf": 0.05,
+    }
+    assert gate._tensorcore_preflight_passes(valid, **limits) is True
+    assert gate._tensorcore_preflight_passes(
+        {**valid, "repeat_exact": False},
+        **limits,
+    ) is False
+    assert gate._tensorcore_preflight_passes(
+        {**valid, "relative_l2_error": 0.02},
+        **limits,
+    ) is False
+
+
 def test_combination_propagates_lm_reduction_policy():
     lm_winner = gate.ComputeCase(
         "lm_winner",
