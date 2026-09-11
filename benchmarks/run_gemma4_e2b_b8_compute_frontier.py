@@ -457,8 +457,13 @@ def _validate_measurement(
         )
     if row.get("lengths") != [workload.output_tokens] * 8:
         errors.append("per-request output lengths differ from the workload")
-    if not compare_generated_tokens(row, reference)["exact_match"]:
-        errors.append("natural greedy tokens differ from production")
+    token_comparison = compare_generated_tokens(row, reference)
+    if not token_comparison["exact_match"]:
+        errors.append(
+            "natural greedy tokens differ from production: "
+            f"agreement={token_comparison['token_agreement']:.6f} "
+            f"first={token_comparison['first_divergence']}"
+        )
     if row.get("engine_prompt_lengths") != reference.get("engine_prompt_lengths"):
         errors.append("effective prompt lengths differ from production")
     if int(

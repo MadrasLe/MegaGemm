@@ -55,7 +55,8 @@ class Gemma4LongSharedMlpPrefillTests(unittest.TestCase):
             "def _mg_gated_activation_fwd_kernel(",
             "0.7978845608028654",
             "0.044715 * gate * gate * gate",
-            "gate * tl.sigmoid(2.0 * inner)",
+            "libdevice.tanh(inner)",
+            "activated.to(tl.bfloat16).to(tl.float32)",
             "def gated_activation_forward(",
             '"gelu_pytorch_tanh"',
         ):

@@ -324,6 +324,34 @@ def test_mlp_chain_route_audit_rejects_silent_fallback():
     assert any("compile rejected" in error for error in errors)
 
 
+def test_measurement_reports_first_natural_token_divergence():
+    workload = gate.Workload(512, 2)
+    reference = {
+        "generated_tokens": 16,
+        "lengths": [2] * 8,
+        "generated_ids": [[1, 2]] * 8,
+        "digest": "reference",
+        "engine_prompt_lengths": [512] * 8,
+        "elapsed_s": 1.0,
+        "scheduler_stats": {
+            "benchmark_forced_token_id": -1,
+            "decode_cuda_graphs": {
+                "enabled": True,
+                "token_burst_size": 16,
+                "replays": 1,
+                "request_scheduler_reused": True,
+                "failures": 0,
+            },
+        },
+    }
+    candidate = dict(reference)
+    candidate["generated_ids"] = [[1, 3], *([[1, 2]] * 7)]
+    candidate["digest"] = "candidate"
+    errors = gate._validate_measurement(candidate, reference, workload)
+    assert any("agreement=0.937500" in error for error in errors)
+    assert any("'token_index': 1" in error for error in errors)
+
+
 def test_combination_propagates_lm_reduction_policy():
     lm_winner = gate.ComputeCase(
         "lm_winner",

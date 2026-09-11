@@ -20,15 +20,20 @@ import torch
 import torch.nn.functional as F
 
 _HAS_TRITON = False
+_HAS_LIBDEVICE = False
 try:
     import triton
     import triton.language as tl
+    from triton.language.extra import libdevice
 
     _HAS_TRITON = True
+    _HAS_LIBDEVICE = True
 except Exception:
     triton = None
     tl = None
+    libdevice = None
     _HAS_TRITON = False
+    _HAS_LIBDEVICE = False
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -331,7 +336,9 @@ if _HAS_TRITON:
             inner = 0.7978845608028654 * (
                 gate + 0.044715 * gate * gate * gate
             )
-            gelu_bf16 = (gate * tl.sigmoid(2.0 * inner)).to(tl.bfloat16)
+            gelu_bf16 = (
+                0.5 * gate * (1.0 + libdevice.tanh(inner))
+            ).to(tl.bfloat16)
             activated = (gelu_bf16.to(tl.float32) * up).to(tl.bfloat16)
             weight = tl.load(
                 w_ptr
@@ -577,6 +584,8 @@ def gemma4_e2b_b8_geglu_down_tensorcore(
     """
     if not _HAS_TRITON:
         raise RuntimeError("Triton is unavailable")
+    if not _HAS_LIBDEVICE:
+        raise RuntimeError("Triton libdevice is unavailable")
     if torch.is_grad_enabled():
         raise ValueError("Gemma4 E2B B8 Tensor Core MLP requires inference mode")
     if not gate_up.is_cuda or not down_weight.is_cuda or not out.is_cuda:

@@ -12,6 +12,7 @@ def test_tensorcore_mlp_kernel_is_exactly_guarded_to_e2b_b8_large_shape():
     assert "tuple(gate_up.shape) != (8, 24576)" in source
     assert "tuple(down_weight.shape) != (1536, 12288)" in source
     assert "acc += tl.dot(activated, weight)" in source
+    assert "libdevice.tanh(inner)" in source
     assert "This deliberately has no generic fallback" in source
 
 
@@ -26,3 +27,15 @@ def test_model_large_mlp_chain_has_counted_fallbacks():
     assert "_gemma4_flat_b8_gated_activation_runtime_disabled = True" in source
     assert "_gemma4_flat_b8_gated_activation_hits += 1" in source
     assert "activated = torch.nn.functional.gelu" in source
+
+
+def test_fused_gelu_preserves_tanh_and_bf16_materialization_boundary():
+    source = (ROOT / "megagemm" / "kernels" / "swiglu.py").read_text(
+        encoding="utf-8"
+    )
+    gated = source[
+        source.index("def _mg_gated_activation_fwd_kernel(") :
+        source.index("def _mg_conditioned_gelu_tanh_fwd_kernel(")
+    ]
+    assert "libdevice.tanh(inner)" in gated
+    assert "activated.to(tl.bfloat16).to(tl.float32)" in gated

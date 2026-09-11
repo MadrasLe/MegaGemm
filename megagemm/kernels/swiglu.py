@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 from torch.autograd import Function
 
 
@@ -70,7 +71,10 @@ def _mg_gated_activation_fwd_kernel(
         inner = 0.7978845608028654 * (
             gate + 0.044715 * gate * gate * gate
         )
-        activated = gate * tl.sigmoid(2.0 * inner)
+        # Match PyTorch's `gelu(..., approximate="tanh")` implementation,
+        # including the BF16 materialization before the in-place multiply.
+        activated = 0.5 * gate * (1.0 + libdevice.tanh(inner))
+        activated = activated.to(tl.bfloat16).to(tl.float32)
     else:
         activated = gate * tl.sigmoid(gate)
     tl.store(output_ptr + offsets, activated * value, mask=mask)
@@ -115,7 +119,9 @@ def _mg_conditioned_gelu_tanh_fwd_kernel(
         other=0.0,
     ).to(tl.float32)
     inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
-    activated_bf16 = (gate * tl.sigmoid(2.0 * inner)).to(tl.bfloat16)
+    activated_bf16 = (
+        0.5 * gate * (1.0 + libdevice.tanh(inner))
+    ).to(tl.bfloat16)
     tl.store(
         output_ptr + rows * OUTPUT_STRIDE_ROW + cols * OUTPUT_STRIDE_COL,
         activated_bf16.to(tl.float32) * condition,
