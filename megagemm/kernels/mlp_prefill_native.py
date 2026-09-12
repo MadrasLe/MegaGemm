@@ -5,15 +5,28 @@ try:
 except Exception:
     _cuda_ops = None
 
+try:
+    import megagemm_cublaslt_ops as _focused_cublaslt_ops
+except Exception:
+    _focused_cublaslt_ops = None
+
+_cublaslt_ops = (
+    _cuda_ops
+    if _cuda_ops is not None
+    and hasattr(_cuda_ops, "cublaslt_bf16_algorithm_count_cuda")
+    and hasattr(_cuda_ops, "cublaslt_bf16_linear_cuda")
+    else _focused_cublaslt_ops
+)
+
 
 HAS_NATIVE_MLP_PREFILL = bool(
     _cuda_ops is not None
     and hasattr(_cuda_ops, "mlp_prefill_forward_cuda")
 )
 HAS_CUBLASLT_BF16_LINEAR = bool(
-    _cuda_ops is not None
-    and hasattr(_cuda_ops, "cublaslt_bf16_algorithm_count_cuda")
-    and hasattr(_cuda_ops, "cublaslt_bf16_linear_cuda")
+    _cublaslt_ops is not None
+    and hasattr(_cublaslt_ops, "cublaslt_bf16_algorithm_count_cuda")
+    and hasattr(_cublaslt_ops, "cublaslt_bf16_linear_cuda")
 )
 
 
@@ -25,7 +38,7 @@ def cublaslt_bf16_algorithm_count_cuda(
     if not HAS_CUBLASLT_BF16_LINEAR:
         raise RuntimeError("native cuBLASLt BF16 linear op is unavailable")
     return int(
-        _cuda_ops.cublaslt_bf16_algorithm_count_cuda(
+        _cublaslt_ops.cublaslt_bf16_algorithm_count_cuda(
             x,
             weight,
             int(maximum_algorithms),
@@ -44,7 +57,7 @@ def cublaslt_bf16_linear_cuda(
     """Compute ``x @ weight.T`` with one explicit cuBLASLt heuristic."""
     if not HAS_CUBLASLT_BF16_LINEAR:
         raise RuntimeError("native cuBLASLt BF16 linear op is unavailable")
-    return _cuda_ops.cublaslt_bf16_linear_cuda(
+    return _cublaslt_ops.cublaslt_bf16_linear_cuda(
         x,
         weight,
         bias,

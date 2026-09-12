@@ -120,10 +120,17 @@ _force_skip_native = os.environ.get("MEGAGEMM_SKIP_NATIVE", "0") == "1"
 _build_only_rmsnorm_cuda = (
     os.environ.get("MEGAGEMM_BUILD_ONLY_RMSNORM_CUDA", "0") == "1"
 )
+_build_only_cublaslt = (
+    os.environ.get("MEGAGEMM_BUILD_ONLY_CUBLASLT", "0") == "1"
+)
 
 # Pure CPython helper for TTP packet receive.  This intentionally does not use
 # torch.utils.cpp_extension so importing it never depends on libtorch/libc10.
-if not _force_skip_native and not _build_only_rmsnorm_cuda:
+if (
+    not _force_skip_native
+    and not _build_only_rmsnorm_cuda
+    and not _build_only_cublaslt
+):
     ext_modules.append(
         Extension(
             "megagemm_ttp_native",
@@ -143,7 +150,11 @@ try:
     # C++ decode orchestration: full-attention helpers plus native CUDA-graph
     # burst replay.  This remains a CppExtension because graph execution is
     # provided by the torch CUDAGraph binding; no project CUDA source is needed.
-    if not _force_skip_native and not _build_only_rmsnorm_cuda:
+    if (
+        not _force_skip_native
+        and not _build_only_rmsnorm_cuda
+        and not _build_only_cublaslt
+    ):
         ext_modules.append(
             CppExtension(
                 "megagemm_decode_ops",
@@ -155,19 +166,32 @@ try:
 
     if not _force_skip_native and not _force_skip and _can_build_cuda():
         cmdclass = {"build_ext": BuildExtension}
-        ext_modules.append(
-            CUDAExtension(
-                "rmsnorm_cuda_ops",
-                [
-                    "pytorch_binding/binding.cpp",
-                    "src/rmsnorm_kernel.cu",
-                    "src/rope_kernel.cu",
-                    "src/mlp_prefill_kernel.cu",
-                ],
-                libraries=["cublas", "cublasLt"],
-            ),
-        )
-        if not _build_only_rmsnorm_cuda:
+        if _build_only_cublaslt:
+            ext_modules.append(
+                CUDAExtension(
+                    "megagemm_cublaslt_ops",
+                    [
+                        "pytorch_binding/cublaslt_binding.cpp",
+                        "src/mlp_prefill_kernel.cu",
+                    ],
+                    libraries=["cublas", "cublasLt"],
+                ),
+            )
+            print("[MegaGemm] Building only the focused cuBLASLt extension.")
+        else:
+            ext_modules.append(
+                CUDAExtension(
+                    "rmsnorm_cuda_ops",
+                    [
+                        "pytorch_binding/binding.cpp",
+                        "src/rmsnorm_kernel.cu",
+                        "src/rope_kernel.cu",
+                        "src/mlp_prefill_kernel.cu",
+                    ],
+                    libraries=["cublas", "cublasLt"],
+                ),
+            )
+        if not _build_only_rmsnorm_cuda and not _build_only_cublaslt:
             ext_modules.append(
                 CUDAExtension(
                     "sparse24_cuda_ops",
@@ -182,7 +206,7 @@ try:
                 ),
             )
             print("[MegaGemm] Building CUDA extensions (RMSNorm + RoPE + standalone FP16 2:4 mma.sp).")
-        else:
+        elif _build_only_rmsnorm_cuda:
             print("[MegaGemm] Building only rmsnorm_cuda_ops as requested.")
     elif _force_skip_native:
         pass

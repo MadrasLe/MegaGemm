@@ -6507,6 +6507,14 @@ class LlamaMLP(nn.Module):
         self._gemma4_e2b_prefill_gated_activation_hits = 0
         self._gemma4_e2b_prefill_gated_activation_runtime_disabled = False
         self._gemma4_e2b_prefill_gated_activation_failure = ""
+        # Experimental exact-shape cuBLASLt gate-up route.  Algorithm choices
+        # are installed only by the one-load full-model frontier; production
+        # remains torch.mm until that gate promotes a stable shape map.
+        self._gemma4_e2b_prefill_cublaslt_gateup_enabled = False
+        self._gemma4_e2b_prefill_cublaslt_gateup_algorithms = {}
+        self._gemma4_e2b_prefill_cublaslt_gateup_hits = 0
+        self._gemma4_e2b_prefill_cublaslt_gateup_runtime_disabled = False
+        self._gemma4_e2b_prefill_cublaslt_gateup_failure = ""
 
     def _activation(self, gate: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         """Apply gated activation: SiLU (LLaMA/Qwen) or GELU (Gemma 2)."""
@@ -7059,13 +7067,68 @@ class LlamaMLP(nn.Module):
                 and x.is_cuda
                 and not torch.is_grad_enabled()
             ):
-                gate_up = _prefill_linear(
-                    self,
-                    "_fast_gate_up_out",
-                    x,
-                    gate_up_weight,
-                    gate_up_bias,
+                gate_up_out_features = int(gate_up_weight.shape[0])
+                gate_up_sequence_len = (
+                    int(x.shape[1]) if x.ndim == 3 else 0
                 )
+                gate_up_algorithm_key = (
+                    gate_up_sequence_len,
+                    gate_up_out_features,
+                )
+                use_prefill_cublaslt_gateup = bool(
+                    self._gemma4_e2b_prefill_cublaslt_gateup_enabled
+                    and not self._gemma4_e2b_prefill_cublaslt_gateup_runtime_disabled
+                    and HAS_CUBLASLT_BF16_LINEAR
+                    and callable(cublaslt_bf16_linear_cuda)
+                    and x.dtype == torch.bfloat16
+                    and x.ndim == 3
+                    and int(x.shape[0]) == 8
+                    and gate_up_sequence_len in (521, 2057)
+                    and int(x.shape[2]) == 1536
+                    and gate_up_out_features in (12288, 24576)
+                    and gate_up_algorithm_key
+                    in self._gemma4_e2b_prefill_cublaslt_gateup_algorithms
+                )
+                gate_up = None
+                if use_prefill_cublaslt_gateup:
+                    try:
+                        gate_up_out = _get_prefill_out(
+                            self,
+                            "_fast_gate_up_out",
+                            (*x.shape[:-1], gate_up_out_features),
+                            x,
+                        )
+                        x_2d = x.flatten(0, -2)
+                        gate_up_out_2d = gate_up_out.flatten(0, -2)
+                        cublaslt_bf16_linear_cuda(
+                            x_2d,
+                            gate_up_weight,
+                            gate_up_bias,
+                            out=gate_up_out_2d,
+                            algorithm_index=int(
+                                self._gemma4_e2b_prefill_cublaslt_gateup_algorithms[
+                                    gate_up_algorithm_key
+                                ]
+                            ),
+                        )
+                        gate_up = gate_up_out
+                    except Exception as exc:
+                        self._gemma4_e2b_prefill_cublaslt_gateup_runtime_disabled = True
+                        if not self._gemma4_e2b_prefill_cublaslt_gateup_failure:
+                            self._gemma4_e2b_prefill_cublaslt_gateup_failure = (
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                        gate_up = None
+                    else:
+                        self._gemma4_e2b_prefill_cublaslt_gateup_hits += 1
+                if gate_up is None:
+                    gate_up = _prefill_linear(
+                        self,
+                        "_fast_gate_up_out",
+                        x,
+                        gate_up_weight,
+                        gate_up_bias,
+                    )
             elif _can_use_fast_gemv_for(
                 "gate_up",
                 x,
