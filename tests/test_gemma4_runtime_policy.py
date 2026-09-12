@@ -47,6 +47,8 @@ def test_e2b_l4_policy_preserves_measured_multi_step_triton_path():
         (2057, 256, 4, 2, True),
         (2057, 512, 4, 2, True),
     )
+    assert policy.gemma4_e2b_b8_prefill_dense_bridge is True
+    assert policy.gemma4_e2b_b8_prefill_dense_bridge_warps == ((2057, 4),)
     assert policy.gemma4_e2b_b8_prefill_gated_activation is True
     assert policy.gemma4_e2b_b8_prefill_gated_activation_blocks == (
         (521, 256),
@@ -83,6 +85,8 @@ def test_e4b_l4_policy_preserves_measured_step_and_reuse_path():
     assert policy.gemma4_e2b_l4_full_prefill_expand is False
     assert policy.gemma4_e2b_b8_fused_attn_prepare is False
     assert policy.gemma4_e2b_b8_fused_attn_prepare_launches == ()
+    assert policy.gemma4_e2b_b8_prefill_dense_bridge is False
+    assert policy.gemma4_e2b_b8_prefill_dense_bridge_warps == ()
     assert policy.gemma4_e2b_b8_prefill_gated_activation is False
     assert policy.gemma4_e2b_b8_prefill_gated_activation_blocks == ()
     assert policy.gemma4_bf16_fused_gateup_rows == ()
@@ -115,6 +119,8 @@ def test_gemma4_policy_is_not_promoted_to_unmeasured_hardware():
     assert policy.gemma4_e2b_l4_full_prefill_expand is False
     assert policy.gemma4_e2b_b8_fused_attn_prepare is False
     assert policy.gemma4_e2b_b8_fused_attn_prepare_launches == ()
+    assert policy.gemma4_e2b_b8_prefill_dense_bridge is False
+    assert policy.gemma4_e2b_b8_prefill_dense_bridge_warps == ()
     assert policy.gemma4_e2b_b8_prefill_gated_activation is False
     assert policy.gemma4_e2b_b8_prefill_gated_activation_blocks == ()
     assert policy.gemma4_bf16_fused_gateup_rows == ()
@@ -310,6 +316,32 @@ def test_explicit_environment_can_disable_promoted_e2b_prefill_activation(
         model,
         "MEGAGEMM_GEMMA4_E2B_B8_PREFILL_GATED_ACTIVATION",
         "gemma4_e2b_b8_prefill_gated_activation",
+    ) is False
+
+
+def test_explicit_environment_can_disable_promoted_e2b_prefill_dense_bridge(
+    monkeypatch,
+):
+    model = SimpleNamespace(
+        runtime_policy=resolve_runtime_policy(
+            _config(35, 1536, 8, 1), "NVIDIA L4"
+        )
+    )
+
+    assert policy_bool(
+        model,
+        "MEGAGEMM_GEMMA4_E2B_B8_PREFILL_DENSE_BRIDGE",
+        "gemma4_e2b_b8_prefill_dense_bridge",
+    ) is True
+
+    monkeypatch.setenv(
+        "MEGAGEMM_GEMMA4_E2B_B8_PREFILL_DENSE_BRIDGE",
+        "0",
+    )
+    assert policy_bool(
+        model,
+        "MEGAGEMM_GEMMA4_E2B_B8_PREFILL_DENSE_BRIDGE",
+        "gemma4_e2b_b8_prefill_dense_bridge",
     ) is False
 
 

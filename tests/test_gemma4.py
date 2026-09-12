@@ -1539,6 +1539,35 @@ def test_gemma4_e2b_attention_prepare_policy_enables_only_kv_sources():
         for attention in attentions
     )
 
+
+def test_gemma4_e2b_prefill_dense_bridge_policy_is_sequence_scoped():
+    from megagemm.models.runtime_policy import RuntimePolicy
+
+    config = LlamaConfig.from_dict(_tiny_gemma4_config_dict())
+    model = MegaGemmLlama(config).eval()
+    policy = RuntimePolicy(
+        name="gemma4-e2b-l4",
+        hardware="NVIDIA L4",
+        gemma4_e2b_b8_prefill_dense_bridge=True,
+        gemma4_e2b_b8_prefill_dense_bridge_warps=((2057, 4),),
+    )
+
+    with mock.patch(
+        "megagemm.models.llama.resolve_runtime_policy",
+        return_value=policy,
+    ):
+        model._refresh_gemma4_runtime_buffers(device="cpu", dtype=torch.float32)
+
+    assert all(
+        layer._gemma4_e2b_prefill_dense_bridge_enabled
+        for layer in model.layers
+    )
+    assert all(
+        layer._gemma4_e2b_prefill_dense_bridge_warps_by_sequence
+        == {2057: 4}
+        for layer in model.layers
+    )
+
 def test_gemma4_uniform_batch_vectorizes_kv_and_projects_only_last_tokens():
     torch.manual_seed(0)
     config = LlamaConfig.from_dict(_tiny_gemma4_config_dict())

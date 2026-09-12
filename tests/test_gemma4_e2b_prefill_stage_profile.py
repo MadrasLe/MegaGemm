@@ -58,6 +58,11 @@ def _sample(repeat: int, offset: float = 0.0):
             "gated_activation_hits": 35 * repeat,
             "gated_activation_disabled_layers": 0,
             "gated_activation_failure": "",
+            "dense_bridge_enabled_layers": 35,
+            "dense_bridge_warps": {"2057": 4},
+            "dense_bridge_hits": 35 * repeat,
+            "dense_bridge_disabled_layers": 0,
+            "dense_bridge_failure": "",
             "implicit_causal_batches": repeat,
             "vectorized_kv_hits": 15 * repeat,
         },
@@ -113,6 +118,15 @@ def test_route_audit_rejects_stale_attention_frontend_dispatch():
     audit = module.audit_production_prefill_routes(samples)
     assert audit["passed"] is False
     assert any("fused_attn_prepare_launches" in error for error in audit["errors"])
+
+
+def test_route_audit_rejects_stale_dense_bridge_dispatch():
+    module = _load_module()
+    samples = [_sample(1), _sample(2), _sample(3)]
+    samples[1]["prefill_routes"]["dense_bridge_warps"] = {"521": 4}
+    audit = module.audit_production_prefill_routes(samples)
+    assert audit["passed"] is False
+    assert any("dense_bridge_warps" in error for error in audit["errors"])
 
 
 def test_colab_harness_uses_drive_directly_without_vllm_or_git_sync():

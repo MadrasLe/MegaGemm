@@ -44,6 +44,8 @@ class RuntimePolicy:
     gemma4_e2b_b8_fused_attn_prepare_launches: tuple[
         tuple[int, int, int, int, bool], ...
     ] = ()
+    gemma4_e2b_b8_prefill_dense_bridge: bool = False
+    gemma4_e2b_b8_prefill_dense_bridge_warps: tuple[tuple[int, int], ...] = ()
     gemma4_e2b_b8_prefill_gated_activation: bool = False
     gemma4_e2b_b8_prefill_gated_activation_blocks: tuple[tuple[int, int], ...] = ()
     gemma4_bf16_fused_gateup_rows: tuple[int, ...] = ()
@@ -116,6 +118,8 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
                 (2057, 256, 4, 2, True),
                 (2057, 512, 4, 2, True),
             ),
+            gemma4_e2b_b8_prefill_dense_bridge=True,
+            gemma4_e2b_b8_prefill_dense_bridge_warps=((2057, 4),),
             gemma4_e2b_b8_prefill_gated_activation=True,
             gemma4_e2b_b8_prefill_gated_activation_blocks=(
                 (521, 256),
@@ -169,7 +173,10 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
                 "frontend gate promotes split Q/KV RMSNorm, RoPE, layout, and "
                 "cache preparation with H256-W4/H512-W8 for S521 and W4/W4 "
                 "for S2057, improving prefill by 3.89% and 6.32% and wall "
-                "time by 3.85% and 6.18%"
+                "time by 3.85% and 6.18%; the exact-token dense prefill "
+                "bridge gate promotes W4 only for B8/S2057 after improving "
+                "prefill and wall time by 1.35% and 1.33%, while S521 remains "
+                "on the existing unfused path"
             ),
         )
     if topology == (42, 2560, 8, 2):

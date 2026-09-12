@@ -9813,6 +9813,7 @@ class LlamaDecoderLayer(nn.Module):
         self._gemma4_prefill_attn_moe_bridge_error = ""
         self._gemma4_e2b_prefill_dense_bridge_enabled = False
         self._gemma4_e2b_prefill_dense_bridge_num_warps = 4
+        self._gemma4_e2b_prefill_dense_bridge_warps_by_sequence = {}
         self._gemma4_e2b_prefill_dense_bridge_hits = 0
         self._gemma4_e2b_prefill_dense_bridge_runtime_disabled = False
         self._gemma4_e2b_prefill_dense_bridge_failure = ""
@@ -10088,6 +10089,24 @@ class LlamaDecoderLayer(nn.Module):
             bridge_router_in = None
             dense_bridge_mlp_in = None
             dense_bridge_used = False
+            dense_bridge_warps_by_sequence = getattr(
+                self,
+                "_gemma4_e2b_prefill_dense_bridge_warps_by_sequence",
+                {},
+            )
+            dense_bridge_num_warps = dense_bridge_warps_by_sequence.get(
+                int(attn_out.shape[1])
+            )
+            if (
+                dense_bridge_num_warps is None
+                and not dense_bridge_warps_by_sequence
+                and self._gemma4_e2b_prefill_dense_bridge_enabled
+            ):
+                # Frontier compatibility: an experiment may force one launch
+                # width directly without installing a production shape map.
+                dense_bridge_num_warps = int(
+                    self._gemma4_e2b_prefill_dense_bridge_num_warps
+                )
             rows = int(attn_out.numel()) // int(attn_out.shape[-1])
             bridge_used = bool(
                 is_prefill
@@ -10160,7 +10179,10 @@ class LlamaDecoderLayer(nn.Module):
                         if attn_out.is_cuda
                         else ""
                     ),
-                    enabled=self._gemma4_e2b_prefill_dense_bridge_enabled,
+                    enabled=(
+                        self._gemma4_e2b_prefill_dense_bridge_enabled
+                        and dense_bridge_num_warps is not None
+                    ),
                 )
                 and bool(self.post_attention_layernorm.offset)
                 == bool(self.pre_feedforward_layernorm.offset)
@@ -10185,9 +10207,7 @@ class LlamaDecoderLayer(nn.Module):
                             ),
                             out_hidden=residual,
                             pre_ff_out=pre_ff_out,
-                            num_warps=(
-                                self._gemma4_e2b_prefill_dense_bridge_num_warps
-                            ),
+                            num_warps=int(dense_bridge_num_warps),
                         )
                     )
                 except Exception as exc:
@@ -11466,6 +11486,19 @@ class MegaGemmLlama(nn.Module):
                 (),
             )
         }
+        e2b_b8_prefill_dense_bridge = policy_bool(
+            self,
+            "MEGAGEMM_GEMMA4_E2B_B8_PREFILL_DENSE_BRIDGE",
+            "gemma4_e2b_b8_prefill_dense_bridge",
+        )
+        e2b_b8_prefill_dense_bridge_warps = {
+            int(sequence_len): int(num_warps)
+            for sequence_len, num_warps in getattr(
+                self.runtime_policy,
+                "gemma4_e2b_b8_prefill_dense_bridge_warps",
+                (),
+            )
+        }
         e2b_b8_prefill_gated_activation = policy_bool(
             self,
             "MEGAGEMM_GEMMA4_E2B_B8_PREFILL_GATED_ACTIVATION",
@@ -11498,6 +11531,14 @@ class MegaGemmLlama(nn.Module):
                 )
                 attention._gemma4_e2b_l4_fused_attn_prepare_launch_by_shape = dict(
                     e2b_b8_fused_attn_prepare_launches
+                )
+            if hasattr(layer, "_gemma4_e2b_prefill_dense_bridge_enabled"):
+                layer._gemma4_e2b_prefill_dense_bridge_enabled = bool(
+                    e2b_b8_prefill_dense_bridge
+                    and e2b_b8_prefill_dense_bridge_warps
+                )
+                layer._gemma4_e2b_prefill_dense_bridge_warps_by_sequence = dict(
+                    e2b_b8_prefill_dense_bridge_warps
                 )
             mlp = getattr(layer, "mlp", None)
             if mlp is not None and hasattr(
@@ -12475,6 +12516,73 @@ class MegaGemmLlama(nn.Module):
             )
             if failure and not gemma4_e2b_prefill_gated_activation_failure:
                 gemma4_e2b_prefill_gated_activation_failure = failure
+        gemma4_e2b_prefill_dense_bridge_layers = [
+            layer
+            for layer in self.layers
+            if hasattr(layer, "_gemma4_e2b_prefill_dense_bridge_enabled")
+        ]
+        gemma4_e2b_prefill_dense_bridge_enabled_layers = sum(
+            int(
+                bool(
+                    getattr(
+                        layer,
+                        "_gemma4_e2b_prefill_dense_bridge_enabled",
+                        False,
+                    )
+                )
+            )
+            for layer in gemma4_e2b_prefill_dense_bridge_layers
+        )
+        gemma4_e2b_prefill_dense_bridge_hits = sum(
+            int(
+                getattr(
+                    layer,
+                    "_gemma4_e2b_prefill_dense_bridge_hits",
+                    0,
+                )
+            )
+            for layer in gemma4_e2b_prefill_dense_bridge_layers
+        )
+        gemma4_e2b_prefill_dense_bridge_disabled_layers = sum(
+            int(
+                bool(
+                    getattr(
+                        layer,
+                        "_gemma4_e2b_prefill_dense_bridge_runtime_disabled",
+                        False,
+                    )
+                )
+            )
+            for layer in gemma4_e2b_prefill_dense_bridge_layers
+        )
+        gemma4_e2b_prefill_dense_bridge_warps = {}
+        gemma4_e2b_prefill_dense_bridge_failure = ""
+        for layer in gemma4_e2b_prefill_dense_bridge_layers:
+            if getattr(
+                layer,
+                "_gemma4_e2b_prefill_dense_bridge_enabled",
+                False,
+            ):
+                gemma4_e2b_prefill_dense_bridge_warps.update(
+                    {
+                        int(sequence_len): int(num_warps)
+                        for sequence_len, num_warps in getattr(
+                            layer,
+                            "_gemma4_e2b_prefill_dense_bridge_warps_by_sequence",
+                            {},
+                        ).items()
+                    }
+                )
+            failure = str(
+                getattr(
+                    layer,
+                    "_gemma4_e2b_prefill_dense_bridge_failure",
+                    "",
+                )
+                or ""
+            )
+            if failure and not gemma4_e2b_prefill_dense_bridge_failure:
+                gemma4_e2b_prefill_dense_bridge_failure = failure
         qwen3_moe_experts = [
             mlp.experts
             for mlp in mlp_layers
@@ -13828,6 +13936,24 @@ class MegaGemmLlama(nn.Module):
             ),
             "gemma4_e2b_b8_prefill_gated_activation_failure": (
                 gemma4_e2b_prefill_gated_activation_failure
+            ),
+            "gemma4_e2b_b8_prefill_dense_bridge_enabled": bool(
+                gemma4_e2b_prefill_dense_bridge_enabled_layers > 0
+            ),
+            "gemma4_e2b_b8_prefill_dense_bridge_enabled_layers": int(
+                gemma4_e2b_prefill_dense_bridge_enabled_layers
+            ),
+            "gemma4_e2b_b8_prefill_dense_bridge_warps": dict(
+                sorted(gemma4_e2b_prefill_dense_bridge_warps.items())
+            ),
+            "gemma4_e2b_b8_prefill_dense_bridge_hits": int(
+                gemma4_e2b_prefill_dense_bridge_hits
+            ),
+            "gemma4_e2b_b8_prefill_dense_bridge_disabled_layers": int(
+                gemma4_e2b_prefill_dense_bridge_disabled_layers
+            ),
+            "gemma4_e2b_b8_prefill_dense_bridge_failure": (
+                gemma4_e2b_prefill_dense_bridge_failure
             ),
             "gemma4_long_sliding_prefill_enabled": bool(
                 _GEMMA4_LONG_SLIDING_PREFILL

@@ -69,6 +69,9 @@ def _dense_layers(model) -> list[Any]:
 def _apply_case(layers: list[Any], num_warps: int | None) -> None:
     for layer in layers:
         layer._gemma4_e2b_prefill_dense_bridge_enabled = num_warps is not None
+        # The frontier deliberately overrides the production S2057-only map
+        # so every candidate can be measured at both P512 and P2048.
+        layer._gemma4_e2b_prefill_dense_bridge_warps_by_sequence = {}
         if num_warps is not None:
             layer._gemma4_e2b_prefill_dense_bridge_num_warps = int(num_warps)
         layer._gemma4_e2b_prefill_dense_bridge_hits = 0

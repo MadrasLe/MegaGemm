@@ -213,6 +213,7 @@ def audit_production_prefill_routes(
         "full_expand_enabled_layers": 7,
         "fused_attn_prepare_enabled_layers": 15,
         "gated_activation_enabled_layers": 35,
+        "dense_bridge_enabled_layers": 35,
     }
     for key, wanted in expected.items():
         found = values(key)
@@ -242,11 +243,24 @@ def audit_production_prefill_routes(
             f"{found_attn_launches}, expected {expected_attn_launches} in every sample"
         )
 
+    expected_dense_bridge_warps = {"2057": 4}
+    found_dense_bridge_warps = values("dense_bridge_warps")
+    if not found_dense_bridge_warps or any(
+        value != expected_dense_bridge_warps
+        for value in found_dense_bridge_warps
+    ):
+        errors.append(
+            "dense_bridge_warps="
+            f"{found_dense_bridge_warps}, expected "
+            f"{expected_dense_bridge_warps} in every sample"
+        )
+
     for key in (
         "sliding_hits",
         "full_expand_hits",
         "fused_attn_prepare_hits",
         "gated_activation_hits",
+        "dense_bridge_hits",
     ):
         found = [int(value or 0) for value in values(key)]
         if not found or min(found) <= 0:
@@ -288,6 +302,23 @@ def audit_production_prefill_routes(
         errors.append(
             "gated activation runtime-disabled layers were observed: "
             f"{disabled_layers}"
+        )
+
+    dense_bridge_failures = sorted(
+        {str(value) for value in values("dense_bridge_failure") if value}
+    )
+    if dense_bridge_failures:
+        errors.extend(
+            f"dense bridge path error: {value}"
+            for value in dense_bridge_failures
+        )
+    dense_bridge_disabled_layers = [
+        int(value or 0) for value in values("dense_bridge_disabled_layers")
+    ]
+    if any(dense_bridge_disabled_layers):
+        errors.append(
+            "dense bridge runtime-disabled layers were observed: "
+            f"{dense_bridge_disabled_layers}"
         )
 
     return {
@@ -386,6 +417,34 @@ def _measured_sample(runner, prompts: list[str], index: int) -> dict[str, Any]:
             ),
             "gated_activation_failure": str(
                 runtime.get("gemma4_e2b_b8_prefill_gated_activation_failure")
+                or ""
+            ),
+            "dense_bridge_enabled_layers": int(
+                runtime.get(
+                    "gemma4_e2b_b8_prefill_dense_bridge_enabled_layers"
+                )
+                or 0
+            ),
+            "dense_bridge_warps": {
+                str(key): int(value)
+                for key, value in dict(
+                    runtime.get(
+                        "gemma4_e2b_b8_prefill_dense_bridge_warps"
+                    )
+                    or {}
+                ).items()
+            },
+            "dense_bridge_hits": int(
+                runtime.get("gemma4_e2b_b8_prefill_dense_bridge_hits") or 0
+            ),
+            "dense_bridge_disabled_layers": int(
+                runtime.get(
+                    "gemma4_e2b_b8_prefill_dense_bridge_disabled_layers"
+                )
+                or 0
+            ),
+            "dense_bridge_failure": str(
+                runtime.get("gemma4_e2b_b8_prefill_dense_bridge_failure")
                 or ""
             ),
             "implicit_causal_batches": int(

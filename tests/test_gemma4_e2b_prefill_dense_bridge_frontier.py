@@ -48,11 +48,30 @@ def test_model_path_fuses_the_exact_dense_chain():
         encoding="utf-8"
     )
     assert "_gemma4_e2b_prefill_dense_bridge_enabled" in source
+    assert "_gemma4_e2b_prefill_dense_bridge_warps_by_sequence" in source
     assert "rmsnorm_triton_attn_residual_dense(" in source
     assert "out_hidden=residual" in source
     assert "pre_ff_out=pre_ff_out" in source
     assert "self._gemma4_e2b_prefill_dense_bridge_hits += 1" in source
     assert "if not bridge_used and not dense_bridge_used:" in source
+
+
+def test_production_policy_promotes_only_long_context_w4():
+    from megagemm.models.runtime_policy import resolve_runtime_policy
+    from types import SimpleNamespace
+
+    policy = resolve_runtime_policy(
+        SimpleNamespace(
+            model_type="gemma4_text",
+            num_hidden_layers=35,
+            hidden_size=1536,
+            num_attention_heads=8,
+            num_key_value_heads=1,
+        ),
+        "NVIDIA L4",
+    )
+    assert policy.gemma4_e2b_b8_prefill_dense_bridge is True
+    assert policy.gemma4_e2b_b8_prefill_dense_bridge_warps == ((2057, 4),)
 
 
 def test_gate_is_one_model_load_and_three_launch_widths():
