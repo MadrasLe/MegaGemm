@@ -158,6 +158,7 @@ def summarize_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
     groups.sort(key=lambda row: float(row["median_ms"]), reverse=True)
 
     top = ranking[0] if ranking else None
+    route_audit = audit_production_prefill_routes(samples)
     return {
         "samples": len(samples),
         "engine_prefill_tokens_median": int(
@@ -177,6 +178,7 @@ def summarize_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "stage_ranking": ranking,
         "groups": groups,
         "next_target": None if top is None else top["stage"],
+        "route_audit": route_audit,
         "method": {
             "warmup_instrumentation": "disabled",
             "measurement_instrumentation": "CUDA events enabled",
@@ -189,6 +191,56 @@ def summarize_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def audit_production_prefill_routes(
+    samples: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Prove that the profile measured the promoted E2B/L4 B8 paths."""
+    routes = [
+        dict(sample.get("prefill_routes") or {})
+        for sample in samples
+        if sample.get("prefill_routes")
+    ]
+    errors: list[str] = []
+    if len(routes) != len(samples):
+        errors.append("one or more samples did not expose prefill route counters")
+
+    def values(key: str) -> list[Any]:
+        return [route.get(key) for route in routes]
+
+    expected = {
+        "sliding_enabled_layers": 28,
+        "full_expand_enabled_layers": 7,
+    }
+    for key, wanted in expected.items():
+        found = values(key)
+        if not found or any(int(value or 0) != wanted for value in found):
+            errors.append(f"{key}={found}, expected {wanted} in every sample")
+
+    for key in ("sliding_hits", "full_expand_hits"):
+        found = [int(value or 0) for value in values(key)]
+        if not found or min(found) <= 0:
+            errors.append(f"{key} did not prove an active production route: {found}")
+        elif len(found) > 1 and max(found) <= min(found):
+            errors.append(f"{key} did not advance across samples: {found}")
+
+    path_errors = sorted(
+        {
+            str(value)
+            for value in values("full_expand_error")
+            if value
+        }
+    )
+    if path_errors:
+        errors.extend(f"full attention path error: {value}" for value in path_errors)
+
+    return {
+        "passed": not errors,
+        "errors": errors,
+        "samples": routes,
+        "requirements": expected,
+    }
+
+
 def _measured_sample(runner, prompts: list[str], index: int) -> dict[str, Any]:
     result = runner(prompts, 1)
     expected = len(prompts)
@@ -196,6 +248,7 @@ def _measured_sample(runner, prompts: list[str], index: int) -> dict[str, Any]:
     if generated != expected:
         raise RuntimeError(f"generated {generated} tokens; expected {expected}")
     scheduler = dict((result.get("extra") or {}).get("scheduler_stats") or {})
+    runtime = dict((result.get("extra") or {}).get("decode_runtime_stats") or {})
     stage = scheduler.get("prefill_stage_timing")
     if not isinstance(stage, dict) or not stage:
         raise RuntimeError(
@@ -214,6 +267,29 @@ def _measured_sample(runner, prompts: list[str], index: int) -> dict[str, Any]:
             key: float(value)
             for key, value in stage.items()
             if key.endswith("_ms")
+        },
+        "prefill_routes": {
+            "sliding_enabled_layers": int(
+                runtime.get("gemma4_e2b_l4_sliding_prefill_enabled_layers") or 0
+            ),
+            "sliding_hits": int(
+                runtime.get("gemma4_e2b_l4_sliding_prefill_hits") or 0
+            ),
+            "full_expand_enabled_layers": int(
+                runtime.get("gemma4_e2b_l4_full_prefill_expand_enabled_layers") or 0
+            ),
+            "full_expand_hits": int(
+                runtime.get("gemma4_e2b_l4_full_prefill_expand_hits") or 0
+            ),
+            "full_expand_error": str(
+                runtime.get("gemma4_e2b_l4_full_prefill_expand_error") or ""
+            ),
+            "implicit_causal_batches": int(
+                runtime.get("gemma4_implicit_causal_prefill_batches") or 0
+            ),
+            "vectorized_kv_hits": int(
+                runtime.get("gemma4_batch_prefill_vectorized_kv_hits") or 0
+            ),
         },
     }
 
@@ -294,6 +370,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     summary = summarize_samples(samples)
     payload = {
+        "status": "passed" if summary["route_audit"]["passed"] else "invalid",
         "benchmark": "gemma4_e2b_prefill_stage_profile",
         "model": args.model,
         "dtype": "bf16",
@@ -342,6 +419,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         f"unattributed={summary['unattributed_internal_prefill_ms']:.2f}ms"
     )
     print(f"ENGINE_PREFILL_TOKENS {summary['engine_prefill_tokens_median']}")
+    print("ROUTE_AUDIT " + json.dumps(summary["route_audit"], ensure_ascii=False))
     print(f"NEXT_TARGET {summary['next_target']}")
     print("PREFILL_PROFILE " + json.dumps(summary, ensure_ascii=False))
     print(f"Wrote: {args.output}")
@@ -369,8 +447,8 @@ def main() -> int:
         raise SystemExit("this profile is fixed to the validated B8/P2048 workload")
     if args.warmups < 1 or args.repeats < 3:
         raise SystemExit("use at least one warmup and three measured samples")
-    run(args)
-    return 0
+    payload = run(args)
+    return 0 if payload["status"] == "passed" else 2
 
 
 if __name__ == "__main__":

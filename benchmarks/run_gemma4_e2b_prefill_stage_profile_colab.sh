@@ -59,7 +59,4 @@ python benchmarks/run_gemma4_e2b_prefill_stage_profile.py \
   --max-seq-len 2304 \
   --output "$OUT/profile.json"
 
-python -m zipfile -c "$OUT.zip" "$OUT/profile.json"
-
 echo "Resultado: $OUT/profile.json"
-echo "ZIP: $OUT.zip"

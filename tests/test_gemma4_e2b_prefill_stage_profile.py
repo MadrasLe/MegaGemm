@@ -38,6 +38,15 @@ def _sample(repeat: int, offset: float = 0.0):
             "gemma4_norms_ms": 100.0,
             "total_ms": 2000.0 + offset,
         },
+        "prefill_routes": {
+            "sliding_enabled_layers": 28,
+            "sliding_hits": 28 * repeat,
+            "full_expand_enabled_layers": 7,
+            "full_expand_hits": 7 * repeat,
+            "full_expand_error": "",
+            "implicit_causal_batches": repeat,
+            "vectorized_kv_hits": 15 * repeat,
+        },
     }
 
 
@@ -55,6 +64,16 @@ def test_summary_excludes_derived_attention_aggregates_from_ranking_and_groups()
     groups = {row["group"]: row for row in summary["groups"]}
     assert groups["attention"]["median_ms"] == pytest.approx(1200.0)
     assert groups["mlp"]["median_ms"] == pytest.approx(1000.0)
+    assert summary["route_audit"]["passed"] is True
+
+
+def test_route_audit_rejects_stale_full_attention_path():
+    module = _load_module()
+    samples = [_sample(1), _sample(2), _sample(3)]
+    samples[1]["prefill_routes"]["full_expand_enabled_layers"] = 0
+    audit = module.audit_production_prefill_routes(samples)
+    assert audit["passed"] is False
+    assert any("full_expand_enabled_layers" in error for error in audit["errors"])
 
 
 def test_colab_harness_uses_drive_directly_without_vllm_or_git_sync():
@@ -67,6 +86,7 @@ def test_colab_harness_uses_drive_directly_without_vllm_or_git_sync():
     assert "--batch-size 8" in source
     assert "--prompt-tokens 2048" in source
     assert "profile.json" in source
+    assert "zipfile" not in source
 
 
 def test_gemma4_prefill_timing_source_splits_attention_topologies():
