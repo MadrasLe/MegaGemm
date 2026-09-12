@@ -825,6 +825,32 @@ def _gemma4_a100_a4b_fused_attn_prepare_shape(
     )
 
 
+def _gemma4_e2b_l4_fused_attn_prepare_shape(
+    batch_size: int,
+    rows: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    dtype: torch.dtype,
+    device_name: str,
+    *,
+    enabled: bool,
+) -> bool:
+    """Guard the experimental E2B/L4 frontend to its measured B8 shapes."""
+    return bool(
+        enabled
+        and _GEMMA4_FUSED_ATTN_PREP_PREFILL
+        and int(batch_size) == 8
+        and int(rows) in (521, 2057)
+        and (int(num_q_heads), int(num_kv_heads), int(head_dim))
+        in ((8, 1, 256), (8, 1, 512))
+        and int(rotary_dim) == int(head_dim)
+        and dtype == torch.bfloat16
+        and "L4" in str(device_name).upper()
+    )
+
+
 def _gemma4_a100_a4b_long_kv_scatter_tokens_per_program(
     batch_size: int,
     seq_len: int,
@@ -4764,6 +4790,11 @@ class LlamaAttention(nn.Module):
         self._gemma4_fused_attn_prepare_hits = 0
         self._gemma4_fused_attn_prepare_skip_reason = ""
         self._gemma4_fused_attn_prepare_disabled = False
+        self._gemma4_e2b_l4_fused_attn_prepare_enabled = False
+        self._gemma4_e2b_l4_fused_attn_prepare_hits = 0
+        self._gemma4_e2b_l4_fused_attn_prepare_launch = (4, 2, False)
+        self._gemma4_e2b_l4_fused_attn_prepare_launch_by_shape = {}
+        self._gemma4_e2b_l4_fused_attn_prepare_failure = ""
         self._gemma4_implicit_causal_prefill_hits = 0
         self._gemma4_e2b_l4_sliding_prefill_enabled = False
         self._gemma4_e2b_l4_sliding_prefill_hits = 0
@@ -5208,7 +5239,8 @@ class LlamaAttention(nn.Module):
         if not q_raw.is_cuda:
             self._gemma4_fused_attn_prepare_skip_reason = "requires CUDA"
             return None
-        if not _gemma4_a100_a4b_fused_attn_prepare_shape(
+        device_name = torch.cuda.get_device_name(q_raw.device)
+        a4b_shape = _gemma4_a100_a4b_fused_attn_prepare_shape(
             bsz,
             seq_len,
             self.num_q_heads,
@@ -5216,8 +5248,20 @@ class LlamaAttention(nn.Module):
             self.head_dim,
             self.rotary_dim,
             q_raw.dtype,
-            torch.cuda.get_device_name(q_raw.device),
-        ):
+            device_name,
+        )
+        e2b_shape = _gemma4_e2b_l4_fused_attn_prepare_shape(
+            bsz,
+            seq_len,
+            self.num_q_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.rotary_dim,
+            q_raw.dtype,
+            device_name,
+            enabled=self._gemma4_e2b_l4_fused_attn_prepare_enabled,
+        )
+        if not (a4b_shape or e2b_shape):
             self._gemma4_fused_attn_prepare_skip_reason = "shape policy"
             return None
         if (
@@ -5261,6 +5305,18 @@ class LlamaAttention(nn.Module):
             (bsz, seq_len, self.num_kv_heads, self.head_dim),
             q_raw,
         )
+        launch = self._gemma4_e2b_l4_fused_attn_prepare_launch
+        if e2b_shape:
+            launch = self._gemma4_e2b_l4_fused_attn_prepare_launch_by_shape.get(
+                (int(seq_len), int(self.head_dim)), launch
+            )
+        if len(launch) == 2:
+            num_warps, num_stages = map(int, launch)
+            split_qkv = False
+        else:
+            num_warps = int(launch[0])
+            num_stages = int(launch[1])
+            split_qkv = bool(launch[2])
         try:
             result = gemma4_prefill_attention_prepare(
                 q_raw,
@@ -5280,14 +5336,24 @@ class LlamaAttention(nn.Module):
                 v_out=v_out,
                 k_cache=k_cache,
                 v_cache=v_cache,
+                num_warps=num_warps,
+                num_stages=num_stages,
+                split_qkv=split_qkv,
             )
         except Exception as exc:
             self._gemma4_fused_attn_prepare_disabled = True
             self._gemma4_fused_attn_prepare_skip_reason = (
                 f"{type(exc).__name__}: {exc}"
             )
+            if e2b_shape:
+                self._gemma4_e2b_l4_fused_attn_prepare_failure = (
+                    self._gemma4_fused_attn_prepare_skip_reason
+                )
             return None
         self._gemma4_fused_attn_prepare_hits += 1
+        if e2b_shape:
+            self._gemma4_e2b_l4_fused_attn_prepare_hits += 1
+            self._gemma4_e2b_l4_fused_attn_prepare_failure = ""
         self._gemma4_fused_attn_prepare_skip_reason = ""
         return result
 
