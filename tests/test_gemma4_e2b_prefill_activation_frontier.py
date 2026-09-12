@@ -20,9 +20,20 @@ def test_model_path_is_exactly_guarded_and_counted():
     assert "_gemma4_e2b_prefill_gated_activation_enabled" in source
     assert "and int(gate_up.shape[0]) == 8" in source
     assert "and int(gate_up.shape[1]) in (521, 2057)" in source
+    assert "activation_block_size = block_size_override or int(" in source
+    assert "_gemma4_e2b_prefill_gated_activation_block_sizes" in source
     assert "and int(self.intermediate_size) in (6144, 12288)" in source
     assert "self._gemma4_e2b_prefill_gated_activation_hits += 1" in source
     assert '"activation", activation_start_end' in source
+
+
+def test_runtime_policy_promotes_only_the_measured_shape_dispatch():
+    source = (ROOT / "megagemm" / "models" / "runtime_policy.py").read_text(
+        encoding="utf-8"
+    )
+    assert "gemma4_e2b_b8_prefill_gated_activation=True" in source
+    assert "(521, 256)" in source
+    assert "(2057, 512)" in source
 
 
 def test_gate_is_one_model_load_full_model_matrix():

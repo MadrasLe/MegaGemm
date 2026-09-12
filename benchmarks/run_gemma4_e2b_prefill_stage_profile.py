@@ -211,13 +211,22 @@ def audit_production_prefill_routes(
     expected = {
         "sliding_enabled_layers": 28,
         "full_expand_enabled_layers": 7,
+        "gated_activation_enabled_layers": 35,
     }
     for key, wanted in expected.items():
         found = values(key)
         if not found or any(int(value or 0) != wanted for value in found):
             errors.append(f"{key}={found}, expected {wanted} in every sample")
 
-    for key in ("sliding_hits", "full_expand_hits"):
+    expected_blocks = {"521": 256, "2057": 512}
+    found_blocks = values("gated_activation_block_sizes")
+    if not found_blocks or any(value != expected_blocks for value in found_blocks):
+        errors.append(
+            "gated_activation_block_sizes="
+            f"{found_blocks}, expected {expected_blocks} in every sample"
+        )
+
+    for key in ("sliding_hits", "full_expand_hits", "gated_activation_hits"):
         found = [int(value or 0) for value in values(key)]
         if not found or min(found) <= 0:
             errors.append(f"{key} did not prove an active production route: {found}")
@@ -233,6 +242,23 @@ def audit_production_prefill_routes(
     )
     if path_errors:
         errors.extend(f"full attention path error: {value}" for value in path_errors)
+
+    gated_activation_failures = sorted(
+        {str(value) for value in values("gated_activation_failure") if value}
+    )
+    if gated_activation_failures:
+        errors.extend(
+            f"gated activation path error: {value}"
+            for value in gated_activation_failures
+        )
+    disabled_layers = [
+        int(value or 0) for value in values("gated_activation_disabled_layers")
+    ]
+    if any(disabled_layers):
+        errors.append(
+            "gated activation runtime-disabled layers were observed: "
+            f"{disabled_layers}"
+        )
 
     return {
         "passed": not errors,
@@ -284,6 +310,34 @@ def _measured_sample(runner, prompts: list[str], index: int) -> dict[str, Any]:
             ),
             "full_expand_error": str(
                 runtime.get("gemma4_e2b_l4_full_prefill_expand_error") or ""
+            ),
+            "gated_activation_enabled_layers": int(
+                runtime.get(
+                    "gemma4_e2b_b8_prefill_gated_activation_enabled_layers"
+                )
+                or 0
+            ),
+            "gated_activation_block_sizes": {
+                str(key): int(value)
+                for key, value in dict(
+                    runtime.get(
+                        "gemma4_e2b_b8_prefill_gated_activation_block_sizes"
+                    )
+                    or {}
+                ).items()
+            },
+            "gated_activation_hits": int(
+                runtime.get("gemma4_e2b_b8_prefill_gated_activation_hits") or 0
+            ),
+            "gated_activation_disabled_layers": int(
+                runtime.get(
+                    "gemma4_e2b_b8_prefill_gated_activation_disabled_layers"
+                )
+                or 0
+            ),
+            "gated_activation_failure": str(
+                runtime.get("gemma4_e2b_b8_prefill_gated_activation_failure")
+                or ""
             ),
             "implicit_causal_batches": int(
                 runtime.get("gemma4_implicit_causal_prefill_batches") or 0

@@ -716,6 +716,7 @@ def write_outputs(args: argparse.Namespace, rows: list[dict[str, Any]]) -> tuple
                     "MEGAGEMM_GEMMA4_E2B_L4_SLIDING_BLOCK_N",
                     "MEGAGEMM_GEMMA4_E2B_L4_SLIDING_NUM_WARPS",
                     "MEGAGEMM_GEMMA4_E2B_L4_SLIDING_NUM_STAGES",
+                    "MEGAGEMM_GEMMA4_E2B_B8_PREFILL_GATED_ACTIVATION",
                     "MEGAGEMM_SKIP_CUDA",
                     "MICROGEMM_CACHE_DIR",
                     "OMP_NUM_THREADS",

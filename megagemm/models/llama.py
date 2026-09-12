@@ -6498,11 +6498,12 @@ class LlamaMLP(nn.Module):
         self._prefill_deepfusion_use_cache = {}
         self._prefill_deepfusion_bench = {}
         self._disable_native_mlp_prefill = False
-        # Experimental full-model gate for the exact Gemma 4 E2B/L4 B8
-        # prefill shapes.  This stays off in production until the same loaded
-        # model proves a wall-time win for each prompt regime independently.
+        # Shape-specific Gemma 4 E2B/L4 B8 prefill GELU-tanh x value path.
+        # A positive scalar block size is an experiment override; production
+        # uses the per-sequence map installed by the measured runtime policy.
         self._gemma4_e2b_prefill_gated_activation_enabled = False
-        self._gemma4_e2b_prefill_gated_activation_block_size = 512
+        self._gemma4_e2b_prefill_gated_activation_block_size = 0
+        self._gemma4_e2b_prefill_gated_activation_block_sizes = {}
         self._gemma4_e2b_prefill_gated_activation_hits = 0
         self._gemma4_e2b_prefill_gated_activation_runtime_disabled = False
         self._gemma4_e2b_prefill_gated_activation_failure = ""
@@ -6579,6 +6580,16 @@ class LlamaMLP(nn.Module):
     ) -> torch.Tensor:
         activation_start_end = _timing_record_start(do_prefill_stage_timing)
         if self.hidden_act in ('gelu', 'gelu_pytorch_tanh'):
+            sequence_len = int(gate_up.shape[1]) if gate_up.ndim == 3 else 0
+            block_size_override = int(
+                self._gemma4_e2b_prefill_gated_activation_block_size or 0
+            )
+            activation_block_size = block_size_override or int(
+                self._gemma4_e2b_prefill_gated_activation_block_sizes.get(
+                    sequence_len,
+                    0,
+                )
+            )
             use_gated_activation = bool(
                 self._gemma4_e2b_prefill_gated_activation_enabled
                 and not self._gemma4_e2b_prefill_gated_activation_runtime_disabled
@@ -6588,6 +6599,7 @@ class LlamaMLP(nn.Module):
                 and gate_up.ndim == 3
                 and int(gate_up.shape[0]) == 8
                 and int(gate_up.shape[1]) in (521, 2057)
+                and activation_block_size in (128, 256, 512, 1024)
                 and int(self.down_proj.out_features) == 1536
                 and int(self.intermediate_size) in (6144, 12288)
             )
@@ -6605,9 +6617,7 @@ class LlamaMLP(nn.Module):
                         self.intermediate_size,
                         activation="gelu_tanh",
                         out=activated_out,
-                        block_size=(
-                            self._gemma4_e2b_prefill_gated_activation_block_size
-                        ),
+                        block_size=activation_block_size,
                     )
                 except Exception as exc:
                     self._gemma4_e2b_prefill_gated_activation_runtime_disabled = True
@@ -11214,6 +11224,19 @@ class MegaGemmLlama(nn.Module):
             "MEGAGEMM_GEMMA4_E2B_L4_FULL_PREFILL_EXPAND",
             "gemma4_e2b_l4_full_prefill_expand",
         )
+        e2b_b8_prefill_gated_activation = policy_bool(
+            self,
+            "MEGAGEMM_GEMMA4_E2B_B8_PREFILL_GATED_ACTIVATION",
+            "gemma4_e2b_b8_prefill_gated_activation",
+        )
+        e2b_b8_prefill_gated_activation_blocks = {
+            int(sequence_len): int(block_size)
+            for sequence_len, block_size in getattr(
+                self.runtime_policy,
+                "gemma4_e2b_b8_prefill_gated_activation_blocks",
+                (),
+            )
+        }
         for layer in self.layers:
             attention = getattr(layer, "self_attn", None)
             if attention is not None:
@@ -11225,6 +11248,19 @@ class MegaGemmLlama(nn.Module):
                 )
                 attention._gemma4_e2b_l4_full_prefill_expand_enabled = bool(
                     e2b_l4_full_prefill_expand and sliding_window <= 0
+                )
+            mlp = getattr(layer, "mlp", None)
+            if mlp is not None and hasattr(
+                mlp,
+                "_gemma4_e2b_prefill_gated_activation_enabled",
+            ):
+                mlp._gemma4_e2b_prefill_gated_activation_enabled = bool(
+                    e2b_b8_prefill_gated_activation
+                    and e2b_b8_prefill_gated_activation_blocks
+                )
+                mlp._gemma4_e2b_prefill_gated_activation_block_size = 0
+                mlp._gemma4_e2b_prefill_gated_activation_block_sizes = dict(
+                    e2b_b8_prefill_gated_activation_blocks
                 )
         explicit_rmsnorm = os.environ.get(
             "MEGAGEMM_DISABLE_CUDA_RMSNORM", ""
@@ -12127,6 +12163,68 @@ class MegaGemmLlama(nn.Module):
             for layer in self.layers
             if getattr(layer, "mlp", None) is not None
         ]
+        gemma4_e2b_prefill_gated_activation_enabled_layers = sum(
+            int(
+                bool(
+                    getattr(
+                        mlp,
+                        "_gemma4_e2b_prefill_gated_activation_enabled",
+                        False,
+                    )
+                )
+            )
+            for mlp in mlp_layers
+        )
+        gemma4_e2b_prefill_gated_activation_hits = sum(
+            int(
+                getattr(
+                    mlp,
+                    "_gemma4_e2b_prefill_gated_activation_hits",
+                    0,
+                )
+            )
+            for mlp in mlp_layers
+        )
+        gemma4_e2b_prefill_gated_activation_disabled_layers = sum(
+            int(
+                bool(
+                    getattr(
+                        mlp,
+                        "_gemma4_e2b_prefill_gated_activation_runtime_disabled",
+                        False,
+                    )
+                )
+            )
+            for mlp in mlp_layers
+        )
+        gemma4_e2b_prefill_gated_activation_block_sizes = {}
+        gemma4_e2b_prefill_gated_activation_failure = ""
+        for mlp in mlp_layers:
+            if getattr(
+                mlp,
+                "_gemma4_e2b_prefill_gated_activation_enabled",
+                False,
+            ):
+                gemma4_e2b_prefill_gated_activation_block_sizes.update(
+                    {
+                        int(sequence_len): int(block_size)
+                        for sequence_len, block_size in getattr(
+                            mlp,
+                            "_gemma4_e2b_prefill_gated_activation_block_sizes",
+                            {},
+                        ).items()
+                    }
+                )
+            failure = str(
+                getattr(
+                    mlp,
+                    "_gemma4_e2b_prefill_gated_activation_failure",
+                    "",
+                )
+                or ""
+            )
+            if failure and not gemma4_e2b_prefill_gated_activation_failure:
+                gemma4_e2b_prefill_gated_activation_failure = failure
         qwen3_moe_experts = [
             mlp.experts
             for mlp in mlp_layers
@@ -13415,6 +13513,24 @@ class MegaGemmLlama(nn.Module):
             ),
             "gemma4_e2b_l4_full_prefill_expand_error": (
                 gemma4_e2b_l4_full_prefill_expand_error
+            ),
+            "gemma4_e2b_b8_prefill_gated_activation_enabled": bool(
+                gemma4_e2b_prefill_gated_activation_enabled_layers > 0
+            ),
+            "gemma4_e2b_b8_prefill_gated_activation_enabled_layers": int(
+                gemma4_e2b_prefill_gated_activation_enabled_layers
+            ),
+            "gemma4_e2b_b8_prefill_gated_activation_block_sizes": dict(
+                sorted(gemma4_e2b_prefill_gated_activation_block_sizes.items())
+            ),
+            "gemma4_e2b_b8_prefill_gated_activation_hits": int(
+                gemma4_e2b_prefill_gated_activation_hits
+            ),
+            "gemma4_e2b_b8_prefill_gated_activation_disabled_layers": int(
+                gemma4_e2b_prefill_gated_activation_disabled_layers
+            ),
+            "gemma4_e2b_b8_prefill_gated_activation_failure": (
+                gemma4_e2b_prefill_gated_activation_failure
             ),
             "gemma4_long_sliding_prefill_enabled": bool(
                 _GEMMA4_LONG_SLIDING_PREFILL

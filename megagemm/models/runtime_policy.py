@@ -40,6 +40,8 @@ class RuntimePolicy:
     gemma4_e2b_b8_tensorcore_down_decode: bool = False
     gemma4_e2b_l4_sliding_prefill: bool = False
     gemma4_e2b_l4_full_prefill_expand: bool = False
+    gemma4_e2b_b8_prefill_gated_activation: bool = False
+    gemma4_e2b_b8_prefill_gated_activation_blocks: tuple[tuple[int, int], ...] = ()
     gemma4_bf16_fused_gateup_rows: tuple[int, ...] = ()
     gemma4_bf16_deepfusion_rows: tuple[int, ...] = ()
     gemma4_bf16_cublas_gateup_rows: tuple[int, ...] = ()
@@ -103,6 +105,11 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
             gemma4_e2b_b1_dense_bridge=True,
             gemma4_e2b_l4_sliding_prefill=True,
             gemma4_e2b_l4_full_prefill_expand=True,
+            gemma4_e2b_b8_prefill_gated_activation=True,
+            gemma4_e2b_b8_prefill_gated_activation_blocks=(
+                (521, 256),
+                (2057, 512),
+            ),
             gemma4_bf16_cublas_gateup_rows=(8,),
             gemma4_bf16_cublas_down_rows=(8,),
             reason=(
@@ -143,6 +150,11 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
                 "decode throughput by 2.19%, improved every end-to-end scenario, "
                 "and preserved exact greedy tokens; experimental large MLP "
                 "paths remain unpromoted"
+                "; the exact-token, one-load B8 prefill activation frontier "
+                "promotes the fused GELU-tanh times value kernel with a "
+                "shape dispatch of block 256 for S521 and block 512 for "
+                "S2057 (1.045x and 1.066x prefill speedup respectively; "
+                "1.055x geometric mean)"
             ),
         )
     if topology == (42, 2560, 8, 2):

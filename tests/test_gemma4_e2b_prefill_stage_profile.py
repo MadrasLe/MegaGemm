@@ -44,6 +44,11 @@ def _sample(repeat: int, offset: float = 0.0):
             "full_expand_enabled_layers": 7,
             "full_expand_hits": 7 * repeat,
             "full_expand_error": "",
+            "gated_activation_enabled_layers": 35,
+            "gated_activation_block_sizes": {"521": 256, "2057": 512},
+            "gated_activation_hits": 35 * repeat,
+            "gated_activation_disabled_layers": 0,
+            "gated_activation_failure": "",
             "implicit_causal_batches": repeat,
             "vectorized_kv_hits": 15 * repeat,
         },
@@ -74,6 +79,18 @@ def test_route_audit_rejects_stale_full_attention_path():
     audit = module.audit_production_prefill_routes(samples)
     assert audit["passed"] is False
     assert any("full_expand_enabled_layers" in error for error in audit["errors"])
+
+
+def test_route_audit_rejects_stale_gated_activation_path():
+    module = _load_module()
+    samples = [_sample(1), _sample(2), _sample(3)]
+    samples[1]["prefill_routes"]["gated_activation_block_sizes"] = {
+        "521": 512,
+        "2057": 512,
+    }
+    audit = module.audit_production_prefill_routes(samples)
+    assert audit["passed"] is False
+    assert any("gated_activation_block_sizes" in error for error in audit["errors"])
 
 
 def test_colab_harness_uses_drive_directly_without_vllm_or_git_sync():

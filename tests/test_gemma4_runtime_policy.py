@@ -40,6 +40,11 @@ def test_e2b_l4_policy_preserves_measured_multi_step_triton_path():
     assert policy.gemma4_ple_conditioned_gelu_decode is False
     assert policy.gemma4_e2b_l4_sliding_prefill is True
     assert policy.gemma4_e2b_l4_full_prefill_expand is True
+    assert policy.gemma4_e2b_b8_prefill_gated_activation is True
+    assert policy.gemma4_e2b_b8_prefill_gated_activation_blocks == (
+        (521, 256),
+        (2057, 512),
+    )
     assert policy.gemma4_bf16_fused_gateup_rows == ()
     assert policy.gemma4_bf16_deepfusion_rows == ()
     assert policy.gemma4_bf16_cublas_gateup_rows == (8,)
@@ -69,6 +74,8 @@ def test_e4b_l4_policy_preserves_measured_step_and_reuse_path():
     assert policy.gemma4_ple_conditioned_gelu_decode is False
     assert policy.gemma4_e2b_l4_sliding_prefill is False
     assert policy.gemma4_e2b_l4_full_prefill_expand is False
+    assert policy.gemma4_e2b_b8_prefill_gated_activation is False
+    assert policy.gemma4_e2b_b8_prefill_gated_activation_blocks == ()
     assert policy.gemma4_bf16_fused_gateup_rows == ()
     assert policy.gemma4_bf16_deepfusion_rows == ()
     assert policy.gemma4_bf16_cublas_gateup_rows == ()
@@ -97,6 +104,8 @@ def test_gemma4_policy_is_not_promoted_to_unmeasured_hardware():
     assert policy.gemma4_ple_conditioned_gelu_decode is False
     assert policy.gemma4_e2b_l4_sliding_prefill is False
     assert policy.gemma4_e2b_l4_full_prefill_expand is False
+    assert policy.gemma4_e2b_b8_prefill_gated_activation is False
+    assert policy.gemma4_e2b_b8_prefill_gated_activation_blocks == ()
     assert policy.gemma4_bf16_fused_gateup_rows == ()
     assert policy.gemma4_bf16_deepfusion_rows == ()
     assert policy.gemma4_bf16_cublas_gateup_rows == ()
@@ -264,6 +273,32 @@ def test_explicit_environment_can_disable_promoted_e2b_full_prefill_expand(
         model,
         "MEGAGEMM_GEMMA4_E2B_L4_FULL_PREFILL_EXPAND",
         "gemma4_e2b_l4_full_prefill_expand",
+    ) is False
+
+
+def test_explicit_environment_can_disable_promoted_e2b_prefill_activation(
+    monkeypatch,
+):
+    model = SimpleNamespace(
+        runtime_policy=resolve_runtime_policy(
+            _config(35, 1536, 8, 1), "NVIDIA L4"
+        )
+    )
+
+    assert policy_bool(
+        model,
+        "MEGAGEMM_GEMMA4_E2B_B8_PREFILL_GATED_ACTIVATION",
+        "gemma4_e2b_b8_prefill_gated_activation",
+    ) is True
+
+    monkeypatch.setenv(
+        "MEGAGEMM_GEMMA4_E2B_B8_PREFILL_GATED_ACTIVATION",
+        "0",
+    )
+    assert policy_bool(
+        model,
+        "MEGAGEMM_GEMMA4_E2B_B8_PREFILL_GATED_ACTIVATION",
+        "gemma4_e2b_b8_prefill_gated_activation",
     ) is False
 
 
