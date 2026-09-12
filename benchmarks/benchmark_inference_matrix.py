@@ -816,6 +816,9 @@ def load_megagemm_runner(args: argparse.Namespace, tokenizer):
             },
         }
 
+    # Benchmark gates that rotate experimental policies inside one loaded model
+    # need explicit access without relying on CPython closure internals.
+    run._megagemm_engine = engine
     return run
 
 

@@ -6498,6 +6498,14 @@ class LlamaMLP(nn.Module):
         self._prefill_deepfusion_use_cache = {}
         self._prefill_deepfusion_bench = {}
         self._disable_native_mlp_prefill = False
+        # Experimental full-model gate for the exact Gemma 4 E2B/L4 B8
+        # prefill shapes.  This stays off in production until the same loaded
+        # model proves a wall-time win for each prompt regime independently.
+        self._gemma4_e2b_prefill_gated_activation_enabled = False
+        self._gemma4_e2b_prefill_gated_activation_block_size = 512
+        self._gemma4_e2b_prefill_gated_activation_hits = 0
+        self._gemma4_e2b_prefill_gated_activation_runtime_disabled = False
+        self._gemma4_e2b_prefill_gated_activation_failure = ""
 
     def _activation(self, gate: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         """Apply gated activation: SiLU (LLaMA/Qwen) or GELU (Gemma 2)."""
@@ -6569,10 +6577,51 @@ class LlamaMLP(nn.Module):
         timing_events: Optional[dict] = None,
         do_prefill_stage_timing: bool = False,
     ) -> torch.Tensor:
+        activation_start_end = _timing_record_start(do_prefill_stage_timing)
         if self.hidden_act in ('gelu', 'gelu_pytorch_tanh'):
-            gate = gate_up[..., :self.intermediate_size]
-            value = gate_up[..., self.intermediate_size:]
-            activated = self._activation(gate, value)
+            use_gated_activation = bool(
+                self._gemma4_e2b_prefill_gated_activation_enabled
+                and not self._gemma4_e2b_prefill_gated_activation_runtime_disabled
+                and callable(gated_activation_forward)
+                and gate_up.is_cuda
+                and gate_up.dtype == torch.bfloat16
+                and gate_up.ndim == 3
+                and int(gate_up.shape[0]) == 8
+                and int(gate_up.shape[1]) in (521, 2057)
+                and int(self.down_proj.out_features) == 1536
+                and int(self.intermediate_size) in (6144, 12288)
+            )
+            activated = None
+            if use_gated_activation:
+                try:
+                    activated_out = _get_prefill_out(
+                        self,
+                        "_prefill_activated_out",
+                        (*gate_up.shape[:-1], self.intermediate_size),
+                        gate_up,
+                    )
+                    activated = gated_activation_forward(
+                        gate_up,
+                        self.intermediate_size,
+                        activation="gelu_tanh",
+                        out=activated_out,
+                        block_size=(
+                            self._gemma4_e2b_prefill_gated_activation_block_size
+                        ),
+                    )
+                except Exception as exc:
+                    self._gemma4_e2b_prefill_gated_activation_runtime_disabled = True
+                    if not self._gemma4_e2b_prefill_gated_activation_failure:
+                        self._gemma4_e2b_prefill_gated_activation_failure = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    activated = None
+                else:
+                    self._gemma4_e2b_prefill_gated_activation_hits += 1
+            if activated is None:
+                gate = gate_up[..., :self.intermediate_size]
+                value = gate_up[..., self.intermediate_size:]
+                activated = self._activation(gate, value)
         elif _HAS_TRITON_SWIGLU:
             try:
                 activated_out = None
@@ -6599,6 +6648,7 @@ class LlamaMLP(nn.Module):
             gate = gate_up[..., :self.intermediate_size]
             value = gate_up[..., self.intermediate_size:]
             activated = self._activation(gate, value)
+        _timing_record_end(timing_events, "activation", activation_start_end)
 
         down_weight, down_bias = _linear_weight_bias(self.down_proj)
         down_start_end = _timing_record_start(do_prefill_stage_timing)

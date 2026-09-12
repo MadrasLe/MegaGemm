@@ -51,6 +51,7 @@ GROUPS = {
     "mlp": {
         "mlp_native_ms",
         "gate_up_ms",
+        "activation_ms",
         "down_proj_ms",
     },
     "norm_residual_ple": {
