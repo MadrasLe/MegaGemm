@@ -81,7 +81,9 @@ def _apply_case(
 ) -> None:
     enabled = launch_by_head_dim is not None
     for module in modules:
-        module._gemma4_e2b_l4_fused_attn_prepare_enabled = enabled
+        module._gemma4_e2b_l4_fused_attn_prepare_enabled = bool(
+            enabled and not module.is_kv_shared
+        )
         module._gemma4_e2b_l4_fused_attn_prepare_launch_by_shape = (
             {
                 (521, head_dim): launch

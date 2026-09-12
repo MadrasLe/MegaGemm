@@ -1500,6 +1500,45 @@ def test_gemma4_prefill_runtime_flags_are_scoped_by_attention_type():
     assert sliding_flags == [True, False, True, False]
     assert full_flags == [False, True, False, True]
 
+
+def test_gemma4_e2b_attention_prepare_policy_enables_only_kv_sources():
+    from megagemm.models.runtime_policy import RuntimePolicy
+
+    config = LlamaConfig.from_dict(_tiny_gemma4_config_dict())
+    model = MegaGemmLlama(config).eval()
+    launches = (
+        (521, 256, 4, 2, True),
+        (521, 512, 8, 2, True),
+        (2057, 256, 4, 2, True),
+        (2057, 512, 4, 2, True),
+    )
+    policy = RuntimePolicy(
+        name="gemma4-e2b-l4",
+        hardware="NVIDIA L4",
+        gemma4_e2b_b8_fused_attn_prepare=True,
+        gemma4_e2b_b8_fused_attn_prepare_launches=launches,
+    )
+
+    with mock.patch(
+        "megagemm.models.llama.resolve_runtime_policy",
+        return_value=policy,
+    ):
+        model._refresh_gemma4_runtime_buffers(device="cpu", dtype=torch.float32)
+
+    attentions = [layer.self_attn for layer in model.layers]
+    assert [
+        attention._gemma4_e2b_l4_fused_attn_prepare_enabled
+        for attention in attentions
+    ] == [True, True, True, False]
+    expected = {
+        (sequence_len, head_dim): (warps, stages, split)
+        for sequence_len, head_dim, warps, stages, split in launches
+    }
+    assert all(
+        attention._gemma4_e2b_l4_fused_attn_prepare_launch_by_shape == expected
+        for attention in attentions
+    )
+
 def test_gemma4_uniform_batch_vectorizes_kv_and_projects_only_last_tokens():
     torch.manual_seed(0)
     config = LlamaConfig.from_dict(_tiny_gemma4_config_dict())

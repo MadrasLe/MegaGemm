@@ -11353,6 +11353,23 @@ class MegaGemmLlama(nn.Module):
             "MEGAGEMM_GEMMA4_E2B_L4_FULL_PREFILL_EXPAND",
             "gemma4_e2b_l4_full_prefill_expand",
         )
+        e2b_b8_fused_attn_prepare = policy_bool(
+            self,
+            "MEGAGEMM_GEMMA4_E2B_B8_FUSED_ATTN_PREPARE",
+            "gemma4_e2b_b8_fused_attn_prepare",
+        )
+        e2b_b8_fused_attn_prepare_launches = {
+            (int(sequence_len), int(head_dim)): (
+                int(num_warps),
+                int(num_stages),
+                bool(split_qkv),
+            )
+            for sequence_len, head_dim, num_warps, num_stages, split_qkv in getattr(
+                self.runtime_policy,
+                "gemma4_e2b_b8_fused_attn_prepare_launches",
+                (),
+            )
+        }
         e2b_b8_prefill_gated_activation = policy_bool(
             self,
             "MEGAGEMM_GEMMA4_E2B_B8_PREFILL_GATED_ACTIVATION",
@@ -11377,6 +11394,14 @@ class MegaGemmLlama(nn.Module):
                 )
                 attention._gemma4_e2b_l4_full_prefill_expand_enabled = bool(
                     e2b_l4_full_prefill_expand and sliding_window <= 0
+                )
+                attention._gemma4_e2b_l4_fused_attn_prepare_enabled = bool(
+                    e2b_b8_fused_attn_prepare
+                    and e2b_b8_fused_attn_prepare_launches
+                    and not attention.is_kv_shared
+                )
+                attention._gemma4_e2b_l4_fused_attn_prepare_launch_by_shape = dict(
+                    e2b_b8_fused_attn_prepare_launches
                 )
             mlp = getattr(layer, "mlp", None)
             if mlp is not None and hasattr(
@@ -13238,6 +13263,53 @@ class MegaGemmLlama(nn.Module):
             if reason:
                 gemma4_fused_attn_prepare_skip_reason = reason
                 break
+        gemma4_e2b_l4_fused_attn_prepare_enabled_layers = sum(
+            int(
+                bool(
+                    getattr(
+                        attn,
+                        "_gemma4_e2b_l4_fused_attn_prepare_enabled",
+                        False,
+                    )
+                )
+            )
+            for attn in full_attn_layers
+        )
+        gemma4_e2b_l4_fused_attn_prepare_hits = sum(
+            int(
+                getattr(
+                    attn,
+                    "_gemma4_e2b_l4_fused_attn_prepare_hits",
+                    0,
+                )
+            )
+            for attn in full_attn_layers
+        )
+        gemma4_e2b_l4_fused_attn_prepare_launches = {}
+        gemma4_e2b_l4_fused_attn_prepare_failure = ""
+        for attn in full_attn_layers:
+            if getattr(
+                attn,
+                "_gemma4_e2b_l4_fused_attn_prepare_enabled",
+                False,
+            ):
+                gemma4_e2b_l4_fused_attn_prepare_launches.update(
+                    getattr(
+                        attn,
+                        "_gemma4_e2b_l4_fused_attn_prepare_launch_by_shape",
+                        {},
+                    )
+                )
+            failure = str(
+                getattr(
+                    attn,
+                    "_gemma4_e2b_l4_fused_attn_prepare_failure",
+                    "",
+                )
+                or ""
+            )
+            if failure and not gemma4_e2b_l4_fused_attn_prepare_failure:
+                gemma4_e2b_l4_fused_attn_prepare_failure = failure
         gemma4_implicit_causal_prefill_hits = sum(
             int(getattr(attn, "_gemma4_implicit_causal_prefill_hits", 0))
             for attn in full_attn_layers
@@ -13724,6 +13796,24 @@ class MegaGemmLlama(nn.Module):
             ),
             "gemma4_fused_attn_prepare_skip_reason": (
                 gemma4_fused_attn_prepare_skip_reason
+            ),
+            "gemma4_e2b_b8_fused_attn_prepare_enabled": bool(
+                gemma4_e2b_l4_fused_attn_prepare_enabled_layers > 0
+            ),
+            "gemma4_e2b_b8_fused_attn_prepare_enabled_layers": int(
+                gemma4_e2b_l4_fused_attn_prepare_enabled_layers
+            ),
+            "gemma4_e2b_b8_fused_attn_prepare_hits": int(
+                gemma4_e2b_l4_fused_attn_prepare_hits
+            ),
+            "gemma4_e2b_b8_fused_attn_prepare_launches": {
+                f"{sequence_len}x{head_dim}": list(launch)
+                for (sequence_len, head_dim), launch in sorted(
+                    gemma4_e2b_l4_fused_attn_prepare_launches.items()
+                )
+            },
+            "gemma4_e2b_b8_fused_attn_prepare_failure": (
+                gemma4_e2b_l4_fused_attn_prepare_failure
             ),
             "gemma4_router_fused_norm_scale_hits": int(
                 gemma4_router_fused_norm_scale_hits

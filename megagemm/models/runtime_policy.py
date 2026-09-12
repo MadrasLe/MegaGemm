@@ -40,6 +40,10 @@ class RuntimePolicy:
     gemma4_e2b_b8_tensorcore_down_decode: bool = False
     gemma4_e2b_l4_sliding_prefill: bool = False
     gemma4_e2b_l4_full_prefill_expand: bool = False
+    gemma4_e2b_b8_fused_attn_prepare: bool = False
+    gemma4_e2b_b8_fused_attn_prepare_launches: tuple[
+        tuple[int, int, int, int, bool], ...
+    ] = ()
     gemma4_e2b_b8_prefill_gated_activation: bool = False
     gemma4_e2b_b8_prefill_gated_activation_blocks: tuple[tuple[int, int], ...] = ()
     gemma4_bf16_fused_gateup_rows: tuple[int, ...] = ()
@@ -105,6 +109,13 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
             gemma4_e2b_b1_dense_bridge=True,
             gemma4_e2b_l4_sliding_prefill=True,
             gemma4_e2b_l4_full_prefill_expand=True,
+            gemma4_e2b_b8_fused_attn_prepare=True,
+            gemma4_e2b_b8_fused_attn_prepare_launches=(
+                (521, 256, 4, 2, True),
+                (521, 512, 8, 2, True),
+                (2057, 256, 4, 2, True),
+                (2057, 512, 4, 2, True),
+            ),
             gemma4_e2b_b8_prefill_gated_activation=True,
             gemma4_e2b_b8_prefill_gated_activation_blocks=(
                 (521, 256),
@@ -154,7 +165,11 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
                 "promotes the fused GELU-tanh times value kernel with a "
                 "shape dispatch of block 256 for S521 and block 512 for "
                 "S2057 (1.045x and 1.066x prefill speedup respectively; "
-                "1.055x geometric mean)"
+                "1.055x geometric mean); the one-load exact-token attention "
+                "frontend gate promotes split Q/KV RMSNorm, RoPE, layout, and "
+                "cache preparation with H256-W4/H512-W8 for S521 and W4/W4 "
+                "for S2057, improving prefill by 3.89% and 6.32% and wall "
+                "time by 3.85% and 6.18%"
             ),
         )
     if topology == (42, 2560, 8, 2):

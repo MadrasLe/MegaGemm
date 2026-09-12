@@ -40,6 +40,13 @@ def test_e2b_l4_policy_preserves_measured_multi_step_triton_path():
     assert policy.gemma4_ple_conditioned_gelu_decode is False
     assert policy.gemma4_e2b_l4_sliding_prefill is True
     assert policy.gemma4_e2b_l4_full_prefill_expand is True
+    assert policy.gemma4_e2b_b8_fused_attn_prepare is True
+    assert policy.gemma4_e2b_b8_fused_attn_prepare_launches == (
+        (521, 256, 4, 2, True),
+        (521, 512, 8, 2, True),
+        (2057, 256, 4, 2, True),
+        (2057, 512, 4, 2, True),
+    )
     assert policy.gemma4_e2b_b8_prefill_gated_activation is True
     assert policy.gemma4_e2b_b8_prefill_gated_activation_blocks == (
         (521, 256),
@@ -74,6 +81,8 @@ def test_e4b_l4_policy_preserves_measured_step_and_reuse_path():
     assert policy.gemma4_ple_conditioned_gelu_decode is False
     assert policy.gemma4_e2b_l4_sliding_prefill is False
     assert policy.gemma4_e2b_l4_full_prefill_expand is False
+    assert policy.gemma4_e2b_b8_fused_attn_prepare is False
+    assert policy.gemma4_e2b_b8_fused_attn_prepare_launches == ()
     assert policy.gemma4_e2b_b8_prefill_gated_activation is False
     assert policy.gemma4_e2b_b8_prefill_gated_activation_blocks == ()
     assert policy.gemma4_bf16_fused_gateup_rows == ()
@@ -104,6 +113,8 @@ def test_gemma4_policy_is_not_promoted_to_unmeasured_hardware():
     assert policy.gemma4_ple_conditioned_gelu_decode is False
     assert policy.gemma4_e2b_l4_sliding_prefill is False
     assert policy.gemma4_e2b_l4_full_prefill_expand is False
+    assert policy.gemma4_e2b_b8_fused_attn_prepare is False
+    assert policy.gemma4_e2b_b8_fused_attn_prepare_launches == ()
     assert policy.gemma4_e2b_b8_prefill_gated_activation is False
     assert policy.gemma4_e2b_b8_prefill_gated_activation_blocks == ()
     assert policy.gemma4_bf16_fused_gateup_rows == ()

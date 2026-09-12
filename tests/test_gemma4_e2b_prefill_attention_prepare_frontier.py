@@ -57,6 +57,17 @@ def test_gate_is_one_load_and_audits_all_kv_sources():
     assert "natural-token digest plus exact 15/15 KV-source hit audit" in source
 
 
+def test_runtime_policy_promotes_only_the_two_measured_sequence_shapes():
+    source = (ROOT / "megagemm" / "models" / "runtime_policy.py").read_text(
+        encoding="utf-8"
+    )
+    assert "gemma4_e2b_b8_fused_attn_prepare=True" in source
+    assert "(521, 256, 4, 2, True)" in source
+    assert "(521, 512, 8, 2, True)" in source
+    assert "(2057, 256, 4, 2, True)" in source
+    assert "(2057, 512, 4, 2, True)" in source
+
+
 def test_summary_selects_launch_policy_per_prompt_shape():
     module = _load_benchmark()
     samples = []
