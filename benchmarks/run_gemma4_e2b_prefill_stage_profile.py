@@ -211,6 +211,7 @@ def audit_production_prefill_routes(
     expected = {
         "sliding_enabled_layers": 28,
         "full_expand_enabled_layers": 7,
+        "fused_attn_prepare_enabled_layers": 15,
         "gated_activation_enabled_layers": 35,
     }
     for key, wanted in expected.items():
@@ -226,7 +227,27 @@ def audit_production_prefill_routes(
             f"{found_blocks}, expected {expected_blocks} in every sample"
         )
 
-    for key in ("sliding_hits", "full_expand_hits", "gated_activation_hits"):
+    expected_attn_launches = {
+        "521x256": [4, 2, True],
+        "521x512": [8, 2, True],
+        "2057x256": [4, 2, True],
+        "2057x512": [4, 2, True],
+    }
+    found_attn_launches = values("fused_attn_prepare_launches")
+    if not found_attn_launches or any(
+        value != expected_attn_launches for value in found_attn_launches
+    ):
+        errors.append(
+            "fused_attn_prepare_launches="
+            f"{found_attn_launches}, expected {expected_attn_launches} in every sample"
+        )
+
+    for key in (
+        "sliding_hits",
+        "full_expand_hits",
+        "fused_attn_prepare_hits",
+        "gated_activation_hits",
+    ):
         found = [int(value or 0) for value in values(key)]
         if not found or min(found) <= 0:
             errors.append(f"{key} did not prove an active production route: {found}")
@@ -242,6 +263,15 @@ def audit_production_prefill_routes(
     )
     if path_errors:
         errors.extend(f"full attention path error: {value}" for value in path_errors)
+
+    attention_prepare_failures = sorted(
+        {str(value) for value in values("fused_attn_prepare_failure") if value}
+    )
+    if attention_prepare_failures:
+        errors.extend(
+            f"attention prepare path error: {value}"
+            for value in attention_prepare_failures
+        )
 
     gated_activation_failures = sorted(
         {str(value) for value in values("gated_activation_failure") if value}
@@ -310,6 +340,25 @@ def _measured_sample(runner, prompts: list[str], index: int) -> dict[str, Any]:
             ),
             "full_expand_error": str(
                 runtime.get("gemma4_e2b_l4_full_prefill_expand_error") or ""
+            ),
+            "fused_attn_prepare_enabled_layers": int(
+                runtime.get(
+                    "gemma4_e2b_b8_fused_attn_prepare_enabled_layers"
+                )
+                or 0
+            ),
+            "fused_attn_prepare_hits": int(
+                runtime.get("gemma4_e2b_b8_fused_attn_prepare_hits") or 0
+            ),
+            "fused_attn_prepare_launches": {
+                str(key): list(value)
+                for key, value in dict(
+                    runtime.get("gemma4_e2b_b8_fused_attn_prepare_launches")
+                    or {}
+                ).items()
+            },
+            "fused_attn_prepare_failure": str(
+                runtime.get("gemma4_e2b_b8_fused_attn_prepare_failure") or ""
             ),
             "gated_activation_enabled_layers": int(
                 runtime.get(

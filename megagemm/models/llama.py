@@ -851,6 +851,27 @@ def _gemma4_e2b_l4_fused_attn_prepare_shape(
     )
 
 
+def _gemma4_e2b_l4_prefill_dense_bridge_shape(
+    batch_size: int,
+    seq_len: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    device_name: str,
+    *,
+    enabled: bool,
+) -> bool:
+    """Guard the dense attention-to-MLP bridge to measured E2B/L4 shapes."""
+    return bool(
+        enabled
+        and int(batch_size) == 8
+        and int(seq_len) in (521, 2057)
+        and int(hidden_dim) == 1536
+        and dtype == torch.bfloat16
+        and "L4" in str(device_name).upper()
+        and callable(rmsnorm_triton_attn_residual_dense)
+    )
+
+
 def _gemma4_a100_a4b_long_kv_scatter_tokens_per_program(
     batch_size: int,
     seq_len: int,
@@ -9790,6 +9811,12 @@ class LlamaDecoderLayer(nn.Module):
         self._gemma4_fused_attn_moe_bridge_prefill_hits = 0
         self._gemma4_fused_attn_moe_router_bridge_prefill_hits = 0
         self._gemma4_prefill_attn_moe_bridge_error = ""
+        self._gemma4_e2b_prefill_dense_bridge_enabled = False
+        self._gemma4_e2b_prefill_dense_bridge_num_warps = 4
+        self._gemma4_e2b_prefill_dense_bridge_hits = 0
+        self._gemma4_e2b_prefill_dense_bridge_runtime_disabled = False
+        self._gemma4_e2b_prefill_dense_bridge_failure = ""
+        self._gemma4_e2b_prefill_dense_bridge_pre_ff_out = None
         self._gemma4_prefill_moe_tail_runtime_by_rows: dict[int, bool] = {}
         self._gemma4_fused_post_moe_norm_residual_prefill_hits = 0
         self._gemma4_prefill_moe_tail_error = ""
@@ -10059,6 +10086,8 @@ class LlamaDecoderLayer(nn.Module):
             bridge_shared_in = None
             bridge_expert_in = None
             bridge_router_in = None
+            dense_bridge_mlp_in = None
+            dense_bridge_used = False
             rows = int(attn_out.numel()) // int(attn_out.shape[-1])
             bridge_used = bool(
                 is_prefill
@@ -10114,7 +10143,68 @@ class LlamaDecoderLayer(nn.Module):
                     "gemma4_norms",
                     bridge_start_end,
                 )
-            if not bridge_used:
+            if (
+                not bridge_used
+                and is_prefill
+                and not self.is_moe_layer
+                and not graph_safe_prefill
+                and self.pre_feedforward_layernorm is not None
+                and not self._gemma4_e2b_prefill_dense_bridge_runtime_disabled
+                and _gemma4_e2b_l4_prefill_dense_bridge_shape(
+                    int(attn_out.shape[0]),
+                    int(attn_out.shape[1]),
+                    int(attn_out.shape[2]),
+                    attn_out.dtype,
+                    (
+                        torch.cuda.get_device_name(attn_out.device)
+                        if attn_out.is_cuda
+                        else ""
+                    ),
+                    enabled=self._gemma4_e2b_prefill_dense_bridge_enabled,
+                )
+                and bool(self.post_attention_layernorm.offset)
+                == bool(self.pre_feedforward_layernorm.offset)
+            ):
+                bridge_start_end = _timing_record_start(do_leaf_timing)
+                try:
+                    pre_ff_out = _get_prefill_out(
+                        self,
+                        "_gemma4_e2b_prefill_dense_bridge_pre_ff_out",
+                        tuple(attn_out.shape),
+                        attn_out,
+                    )
+                    hidden_states, dense_bridge_mlp_in = (
+                        rmsnorm_triton_attn_residual_dense(
+                            attn_out,
+                            residual,
+                            self.post_attention_layernorm.weight,
+                            self.pre_feedforward_layernorm.weight,
+                            self.post_attention_layernorm.eps,
+                            norm_offset=bool(
+                                self.post_attention_layernorm.offset
+                            ),
+                            out_hidden=residual,
+                            pre_ff_out=pre_ff_out,
+                            num_warps=(
+                                self._gemma4_e2b_prefill_dense_bridge_num_warps
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    self._gemma4_e2b_prefill_dense_bridge_runtime_disabled = True
+                    self._gemma4_e2b_prefill_dense_bridge_failure = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    dense_bridge_mlp_in = None
+                else:
+                    dense_bridge_used = True
+                    self._gemma4_e2b_prefill_dense_bridge_hits += 1
+                _timing_record_end(
+                    timing_events,
+                    "gemma4_norms",
+                    bridge_start_end,
+                )
+            if not bridge_used and not dense_bridge_used:
                 norm_start_end = _timing_record_start(do_leaf_timing)
                 attn_out = self.post_attention_layernorm(attn_out)
                 _timing_record_end(timing_events, "gemma4_norms", norm_start_end)
@@ -10388,9 +10478,15 @@ class LlamaDecoderLayer(nn.Module):
                         finite_trace, self.layer_idx, "moe.combined_out", mlp_out
                     )
             else:
-                norm_start_end = _timing_record_start(do_leaf_timing)
-                mlp_in = self.pre_feedforward_layernorm(hidden_states)
-                _timing_record_end(timing_events, "gemma4_norms", norm_start_end)
+                mlp_in = dense_bridge_mlp_in
+                if mlp_in is None:
+                    norm_start_end = _timing_record_start(do_leaf_timing)
+                    mlp_in = self.pre_feedforward_layernorm(hidden_states)
+                    _timing_record_end(
+                        timing_events,
+                        "gemma4_norms",
+                        norm_start_end,
+                    )
                 mlp_out = self.mlp(mlp_in, timing_events=timing_events, is_prefill=is_prefill)
                 norm_start_end = _timing_record_start(do_leaf_timing)
                 mlp_out = self.post_feedforward_layernorm(mlp_out)

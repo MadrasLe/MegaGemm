@@ -1127,6 +1127,7 @@ def rmsnorm_triton_attn_residual_dense(
     norm_offset: bool = False,
     out_hidden: Optional[torch.Tensor] = None,
     pre_ff_out: Optional[torch.Tensor] = None,
+    num_warps: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse Gemma4's dense post-attention norm/add/pre-FFN norm bridge.
 
@@ -1215,7 +1216,13 @@ def rmsnorm_triton_attn_residual_dense(
         else pre_ff_out.reshape(-1, n_cols)
     )
     block_size = triton.next_power_of_2(n_cols)
-    num_warps = min(4, max(1, block_size // 256))
+    launch_warps = (
+        min(4, max(1, block_size // 256))
+        if num_warps is None
+        else int(num_warps)
+    )
+    if launch_warps not in (1, 2, 4, 8):
+        raise ValueError("dense attention bridge num_warps must be 1, 2, 4, or 8")
     _rmsnorm_attn_residual_dense_bridge_kernel[(attn_2d.shape[0],)](
         attn_2d,
         residual_2d,
@@ -1232,7 +1239,7 @@ def rmsnorm_triton_attn_residual_dense(
         POST_OFFSET=bool(norm_offset),
         PRE_FF_OFFSET=bool(norm_offset),
         BLOCK_SIZE=block_size,
-        num_warps=num_warps,
+        num_warps=launch_warps,
     )
     return hidden_2d.reshape_as(attn_out), pre_ff_2d.reshape_as(attn_out)
 

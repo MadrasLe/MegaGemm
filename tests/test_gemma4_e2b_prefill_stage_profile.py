@@ -44,6 +44,15 @@ def _sample(repeat: int, offset: float = 0.0):
             "full_expand_enabled_layers": 7,
             "full_expand_hits": 7 * repeat,
             "full_expand_error": "",
+            "fused_attn_prepare_enabled_layers": 15,
+            "fused_attn_prepare_hits": 15 * repeat,
+            "fused_attn_prepare_launches": {
+                "521x256": [4, 2, True],
+                "521x512": [8, 2, True],
+                "2057x256": [4, 2, True],
+                "2057x512": [4, 2, True],
+            },
+            "fused_attn_prepare_failure": "",
             "gated_activation_enabled_layers": 35,
             "gated_activation_block_sizes": {"521": 256, "2057": 512},
             "gated_activation_hits": 35 * repeat,
@@ -91,6 +100,19 @@ def test_route_audit_rejects_stale_gated_activation_path():
     audit = module.audit_production_prefill_routes(samples)
     assert audit["passed"] is False
     assert any("gated_activation_block_sizes" in error for error in audit["errors"])
+
+
+def test_route_audit_rejects_stale_attention_frontend_dispatch():
+    module = _load_module()
+    samples = [_sample(1), _sample(2), _sample(3)]
+    samples[1]["prefill_routes"]["fused_attn_prepare_launches"]["521x512"] = [
+        4,
+        2,
+        True,
+    ]
+    audit = module.audit_production_prefill_routes(samples)
+    assert audit["passed"] is False
+    assert any("fused_attn_prepare_launches" in error for error in audit["errors"])
 
 
 def test_colab_harness_uses_drive_directly_without_vllm_or_git_sync():
