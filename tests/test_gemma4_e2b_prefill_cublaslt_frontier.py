@@ -5,6 +5,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK = ROOT / "benchmarks" / "run_gemma4_e2b_prefill_cublaslt_frontier.py"
 HARNESS = ROOT / "benchmarks" / "run_gemma4_e2b_prefill_cublaslt_frontier_colab.sh"
+DOWN_HARNESS = (
+    ROOT
+    / "benchmarks"
+    / "run_gemma4_e2b_prefill_down_cublaslt_frontier_colab.sh"
+)
 
 
 def _load_benchmark():
@@ -92,6 +97,11 @@ def test_colab_harness_uses_drive_and_ephemeral_build_only():
     assert "zip" not in source.lower()
     assert 'TARGET="${TARGET:-gateup}"' in source
     assert '--target "$TARGET"' in source
+
+    down_source = DOWN_HARNESS.read_text(encoding="utf-8")
+    assert "TARGET=down" in down_source
+    assert "/content/drive/MyDrive/mg/MGRrmsnorm" in down_source
+    assert "git pull" not in down_source
 
 
 def test_frontier_loads_one_model_and_uses_full_model_as_promotion_evidence():
