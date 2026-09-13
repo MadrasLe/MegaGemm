@@ -6628,6 +6628,13 @@ class LlamaMLP(nn.Module):
         self._gemma4_e2b_prefill_fused_gateup_hits = 0
         self._gemma4_e2b_prefill_fused_gateup_runtime_disabled = False
         self._gemma4_e2b_prefill_fused_gateup_failure = ""
+        # Experimental E2B prefill GeGLU + down-projection fusion.  This route
+        # is deliberately opt-in and exact-shape gated until its one-load
+        # full-model frontier proves a stable P512/P2048 policy.
+        self._gemma4_e2b_prefill_geglu_down_enabled = False
+        self._gemma4_e2b_prefill_geglu_down_hits = 0
+        self._gemma4_e2b_prefill_geglu_down_runtime_disabled = False
+        self._gemma4_e2b_prefill_geglu_down_failure = ""
 
     def _activation(self, gate: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         """Apply gated activation: SiLU (LLaMA/Qwen) or GELU (Gemma 2)."""
@@ -6687,6 +6694,11 @@ class LlamaMLP(nn.Module):
             down_bias,
             out=out,
             mode="prefill",
+            activation=(
+                "gelu_tanh"
+                if self.hidden_act in ('gelu', 'gelu_pytorch_tanh')
+                else "silu"
+            ),
         )
 
     def _log_prefill_deepfusion(self, message: str) -> None:
@@ -7378,6 +7390,51 @@ class LlamaMLP(nn.Module):
             _timing_record_end(timing_events, "gate_up", gate_up_start_end)
 
         down_weight, down_bias = _linear_weight_bias(self.down_proj)
+        use_e2b_prefill_geglu_down = bool(
+            not self._awq_separate
+            and is_prefill
+            and self._gemma4_e2b_prefill_geglu_down_enabled
+            and not self._gemma4_e2b_prefill_geglu_down_runtime_disabled
+            and self.hidden_act in ('gelu', 'gelu_pytorch_tanh')
+            and HAS_DEEPFUSION_MLP
+            and callable(deepfusion_swiglu_down)
+            and callable(deepfusion_mlp_prefers_triton_shape)
+            and down_weight is not None
+            and gate_up.is_cuda
+            and gate_up.dtype == torch.bfloat16
+            and not torch.is_grad_enabled()
+            and gate_up.ndim == 3
+            and int(gate_up.shape[0]) == 8
+            and int(gate_up.shape[1]) in (521, 2057)
+            and int(gate_up.shape[2]) == 2 * int(self.intermediate_size)
+            and int(self.intermediate_size) in (6144, 12288)
+            and int(down_weight.shape[0]) == 1536
+            and deepfusion_mlp_prefers_triton_shape(
+                int(self.intermediate_size),
+                int(down_weight.shape[0]),
+                int(gate_up.numel() // gate_up.shape[-1]),
+                mode="prefill",
+            )
+        )
+        if use_e2b_prefill_geglu_down:
+            fused_tail_start_end = _timing_record_start(do_prefill_stage_timing)
+            try:
+                out = self._prefill_deepfusion(gate_up)
+            except Exception as exc:
+                self._gemma4_e2b_prefill_geglu_down_runtime_disabled = True
+                if not self._gemma4_e2b_prefill_geglu_down_failure:
+                    self._gemma4_e2b_prefill_geglu_down_failure = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            else:
+                self._gemma4_e2b_prefill_geglu_down_hits += 1
+                _timing_record_end(
+                    timing_events,
+                    "activation_down_fused",
+                    fused_tail_start_end,
+                )
+                return out
+
         if (
             not self._awq_separate
             and self.hidden_act not in ('gelu', 'gelu_pytorch_tanh')

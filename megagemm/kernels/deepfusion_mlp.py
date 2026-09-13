@@ -159,6 +159,7 @@ if _HAS_TRITON:
         H,
         HAS_BIAS: tl.constexpr,
         ACT: tl.constexpr,
+        IS_BF16: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -197,11 +198,22 @@ if _HAS_TRITON:
                 gate_act = gate * tl.sigmoid(2.0 * inner)
             else:
                 gate_act = gate * tl.sigmoid(gate)
-            act = (gate_act * up).to(tl.float16)
+            # Preserve the same two BF16 materialization boundaries as the
+            # production GeGLU tail: GELU is rounded once, then GELU * up is
+            # rounded again before the BF16 Tensor Core down projection.
+            if IS_BF16:
+                gate_act = gate_act.to(tl.bfloat16).to(tl.float32)
+                act = (gate_act * up).to(tl.bfloat16)
+            else:
+                act = (gate_act * up).to(tl.float16)
 
             w_ptrs = w_ptr + offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk
             w_mask = k_mask[:, None] & n_mask[None, :]
-            w = tl.load(w_ptrs, mask=w_mask, other=0.0).to(tl.float16)
+            w = tl.load(w_ptrs, mask=w_mask, other=0.0)
+            if IS_BF16:
+                w = w.to(tl.bfloat16)
+            else:
+                w = w.to(tl.float16)
 
             acc += tl.dot(act, w)
 
@@ -641,6 +653,7 @@ def deepfusion_swiglu_down(
             h_dim,
             HAS_BIAS=1 if down_bias is not None else 0,
             ACT=act_id,
+            IS_BF16=gate_up.dtype == torch.bfloat16,
         )
         if out is not None:
             return out
