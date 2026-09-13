@@ -18,6 +18,16 @@ try:
 except Exception:
     pass
 
+# Gemma 4 E2B B8 prefill gate/up GEMM + GeGLU experiment (requires Triton)
+try:
+    from .gemma4_e2b_prefill_mlp import (
+        gemma4_e2b_prefill_fused_gateup_geglu,
+        HAS_GEMMA4_E2B_PREFILL_FUSED_GATEUP,
+    )
+except Exception:
+    gemma4_e2b_prefill_fused_gateup_geglu = None
+    HAS_GEMMA4_E2B_PREFILL_FUSED_GATEUP = False
+
 # Fused Add + RMSNorm (requires Triton)
 try:
     from .fused_add_rmsnorm import fused_add_rmsnorm, HAS_FUSED_ADD_RMSNORM

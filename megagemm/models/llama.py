@@ -193,6 +193,14 @@ except Exception:
     native_mlp_prefill_forward_cuda = None
     HAS_CUBLASLT_BF16_LINEAR = False
     HAS_NATIVE_MLP_PREFILL = False
+try:
+    from ..kernels.gemma4_e2b_prefill_mlp import (
+        HAS_GEMMA4_E2B_PREFILL_FUSED_GATEUP,
+        gemma4_e2b_prefill_fused_gateup_geglu,
+    )
+except Exception:
+    HAS_GEMMA4_E2B_PREFILL_FUSED_GATEUP = False
+    gemma4_e2b_prefill_fused_gateup_geglu = None
 
 # Try decode DeepFusion MLP (SwiGLU + down_proj fused)
 try:
@@ -6604,6 +6612,14 @@ class LlamaMLP(nn.Module):
         self._gemma4_e2b_prefill_cublaslt_gateup_hits = 0
         self._gemma4_e2b_prefill_cublaslt_gateup_runtime_disabled = False
         self._gemma4_e2b_prefill_cublaslt_gateup_failure = ""
+        # Experimental fused gate/up GEMM + GeGLU prefill body.  The frontier
+        # installs one explicit launch geometry; production remains disabled
+        # until a loaded-model, natural-token gate promotes a shape policy.
+        self._gemma4_e2b_prefill_fused_gateup_enabled = False
+        self._gemma4_e2b_prefill_fused_gateup_config = {}
+        self._gemma4_e2b_prefill_fused_gateup_hits = 0
+        self._gemma4_e2b_prefill_fused_gateup_runtime_disabled = False
+        self._gemma4_e2b_prefill_fused_gateup_failure = ""
 
     def _activation(self, gate: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         """Apply gated activation: SiLU (LLaMA/Qwen) or GELU (Gemma 2)."""
@@ -6757,6 +6773,18 @@ class LlamaMLP(nn.Module):
             activated = self._activation(gate, value)
         _timing_record_end(timing_events, "activation", activation_start_end)
 
+        return self._prefill_down_projection(
+            activated,
+            timing_events=timing_events,
+            do_prefill_stage_timing=do_prefill_stage_timing,
+        )
+
+    def _prefill_down_projection(
+        self,
+        activated: torch.Tensor,
+        timing_events: Optional[dict] = None,
+        do_prefill_stage_timing: bool = False,
+    ) -> torch.Tensor:
         down_weight, down_bias = _linear_weight_bias(self.down_proj)
         down_start_end = _timing_record_start(do_prefill_stage_timing)
         if _can_use_fast_gemv_for(
@@ -7147,7 +7175,65 @@ class LlamaMLP(nn.Module):
                     except Exception:
                         self._disable_native_mlp_prefill = True
 
-            # FP16 path: fused gate_up_proj
+            # Experimental prefill body: compute gate/up and GeGLU in one
+            # Triton kernel, materializing only [B,S,I] instead of [B,S,2I].
+            fused_gateup_activation = None
+            fused_config = dict(self._gemma4_e2b_prefill_fused_gateup_config or {})
+            use_fused_gateup_activation = bool(
+                is_prefill
+                and self._gemma4_e2b_prefill_fused_gateup_enabled
+                and not self._gemma4_e2b_prefill_fused_gateup_runtime_disabled
+                and HAS_GEMMA4_E2B_PREFILL_FUSED_GATEUP
+                and callable(gemma4_e2b_prefill_fused_gateup_geglu)
+                and self.hidden_act in ('gelu', 'gelu_pytorch_tanh')
+                and x.is_cuda
+                and x.dtype == torch.bfloat16
+                and not torch.is_grad_enabled()
+                and x.ndim == 3
+                and int(x.shape[0]) == 8
+                and int(x.shape[1]) in (521, 2057)
+                and int(x.shape[2]) == 1536
+                and int(self.intermediate_size) in (6144, 12288)
+                and bool(fused_config)
+            )
+            if use_fused_gateup_activation:
+                fused_start_end = _timing_record_start(do_prefill_stage_timing)
+                try:
+                    fused_out = _get_prefill_out(
+                        self,
+                        "_prefill_activated_out",
+                        (*x.shape[:-1], self.intermediate_size),
+                        x,
+                    )
+                    fused_gateup_activation = gemma4_e2b_prefill_fused_gateup_geglu(
+                        x,
+                        self.gate_up_proj.weight,
+                        intermediate_size=self.intermediate_size,
+                        out=fused_out,
+                        **fused_config,
+                    )
+                except Exception as exc:
+                    self._gemma4_e2b_prefill_fused_gateup_runtime_disabled = True
+                    if not self._gemma4_e2b_prefill_fused_gateup_failure:
+                        self._gemma4_e2b_prefill_fused_gateup_failure = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    fused_gateup_activation = None
+                else:
+                    self._gemma4_e2b_prefill_fused_gateup_hits += 1
+                _timing_record_end(
+                    timing_events,
+                    "gate_up_activation_fused",
+                    fused_start_end,
+                )
+            if fused_gateup_activation is not None:
+                return self._prefill_down_projection(
+                    fused_gateup_activation,
+                    timing_events=timing_events,
+                    do_prefill_stage_timing=do_prefill_stage_timing,
+                )
+
+            # FP16/BF16 path: fused gate_up_proj
             gate_up_start_end = _timing_record_start(do_prefill_stage_timing)
             gate_up_weight, gate_up_bias = _linear_weight_bias(self.gate_up_proj)
             if (
@@ -12520,6 +12606,33 @@ class MegaGemmLlama(nn.Module):
             )
             if failure and not gemma4_e2b_prefill_gated_activation_failure:
                 gemma4_e2b_prefill_gated_activation_failure = failure
+        gemma4_e2b_prefill_fused_gateup_enabled_layers = sum(
+            int(bool(getattr(mlp, "_gemma4_e2b_prefill_fused_gateup_enabled", False)))
+            for mlp in mlp_layers
+        )
+        gemma4_e2b_prefill_fused_gateup_hits = sum(
+            int(getattr(mlp, "_gemma4_e2b_prefill_fused_gateup_hits", 0))
+            for mlp in mlp_layers
+        )
+        gemma4_e2b_prefill_fused_gateup_disabled_layers = sum(
+            int(
+                bool(
+                    getattr(
+                        mlp,
+                        "_gemma4_e2b_prefill_fused_gateup_runtime_disabled",
+                        False,
+                    )
+                )
+            )
+            for mlp in mlp_layers
+        )
+        gemma4_e2b_prefill_fused_gateup_failures = sorted(
+            {
+                str(getattr(mlp, "_gemma4_e2b_prefill_fused_gateup_failure", ""))
+                for mlp in mlp_layers
+                if getattr(mlp, "_gemma4_e2b_prefill_fused_gateup_failure", "")
+            }
+        )
         gemma4_e2b_prefill_dense_bridge_layers = [
             layer
             for layer in self.layers
@@ -13940,6 +14053,18 @@ class MegaGemmLlama(nn.Module):
             ),
             "gemma4_e2b_b8_prefill_gated_activation_failure": (
                 gemma4_e2b_prefill_gated_activation_failure
+            ),
+            "gemma4_e2b_b8_prefill_fused_gateup_enabled_layers": int(
+                gemma4_e2b_prefill_fused_gateup_enabled_layers
+            ),
+            "gemma4_e2b_b8_prefill_fused_gateup_hits": int(
+                gemma4_e2b_prefill_fused_gateup_hits
+            ),
+            "gemma4_e2b_b8_prefill_fused_gateup_disabled_layers": int(
+                gemma4_e2b_prefill_fused_gateup_disabled_layers
+            ),
+            "gemma4_e2b_b8_prefill_fused_gateup_failures": list(
+                gemma4_e2b_prefill_fused_gateup_failures
             ),
             "gemma4_e2b_b8_prefill_dense_bridge_enabled": bool(
                 gemma4_e2b_prefill_dense_bridge_enabled_layers > 0
