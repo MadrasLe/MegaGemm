@@ -10020,6 +10020,13 @@ class LlamaDecoderLayer(nn.Module):
         self._gemma4_e2b_prefill_dense_bridge_runtime_disabled = False
         self._gemma4_e2b_prefill_dense_bridge_failure = ""
         self._gemma4_e2b_prefill_dense_bridge_pre_ff_out = None
+        # Experimental dense E2B prefill tail: post-PLE RMSNorm + residual
+        # add + layer scale in one existing Triton kernel.  Kept separate from
+        # the attention bridge so each memory-bound boundary is gated alone.
+        self._gemma4_e2b_prefill_ple_tail_enabled = False
+        self._gemma4_e2b_prefill_ple_tail_hits = 0
+        self._gemma4_e2b_prefill_ple_tail_runtime_disabled = False
+        self._gemma4_e2b_prefill_ple_tail_failure = ""
         self._gemma4_prefill_moe_tail_runtime_by_rows: dict[int, bool] = {}
         self._gemma4_fused_post_moe_norm_residual_prefill_hits = 0
         self._gemma4_prefill_moe_tail_error = ""
@@ -10731,6 +10738,7 @@ class LlamaDecoderLayer(nn.Module):
                     hidden_states,
                 )
 
+            ple_tail_fused = False
             if per_layer_input is not None and self.per_layer_input_gate is not None:
                 ple_start_end = _timing_record_start(do_leaf_timing)
                 residual = hidden_states
@@ -10753,22 +10761,62 @@ class LlamaDecoderLayer(nn.Module):
                     decode_attr="_fast_ple_proj_out",
                     prefill_attr="_prefill_ple_proj_out",
                 )
-                ple = self.post_per_layer_input_norm(ple)
-                if torch.is_grad_enabled():
-                    hidden_states = residual + ple
-                else:
-                    hidden_states = residual.add_(ple)
+                use_prefill_ple_tail = bool(
+                    is_prefill
+                    and not self.is_moe_layer
+                    and self._gemma4_e2b_prefill_ple_tail_enabled
+                    and not self._gemma4_e2b_prefill_ple_tail_runtime_disabled
+                    and callable(rmsnorm_triton_residual_scale_next)
+                    and not graph_safe_prefill
+                    and not torch.is_grad_enabled()
+                    and ple.is_cuda
+                    and ple.dtype == torch.bfloat16
+                    and ple.ndim == 3
+                    and int(ple.shape[0]) == 8
+                    and int(ple.shape[1]) in (521, 2057)
+                    and int(ple.shape[2]) == 1536
+                )
+                if use_prefill_ple_tail:
+                    try:
+                        hidden_states, _ = rmsnorm_triton_residual_scale_next(
+                            ple,
+                            residual,
+                            self.post_per_layer_input_norm.weight,
+                            self.layer_scalar,
+                            None,
+                            self.post_per_layer_input_norm.eps,
+                            norm_offset=bool(
+                                self.post_per_layer_input_norm.offset
+                            ),
+                            out_hidden=residual,
+                        )
+                    except Exception as exc:
+                        self._gemma4_e2b_prefill_ple_tail_runtime_disabled = True
+                        if not self._gemma4_e2b_prefill_ple_tail_failure:
+                            self._gemma4_e2b_prefill_ple_tail_failure = (
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                    else:
+                        ple_tail_fused = True
+                        self._gemma4_e2b_prefill_ple_tail_hits += 1
+                if not ple_tail_fused:
+                    ple = self.post_per_layer_input_norm(ple)
+                    if torch.is_grad_enabled():
+                        hidden_states = residual + ple
+                    else:
+                        hidden_states = residual.add_(ple)
                 _timing_record_end(timing_events, "ple", ple_start_end)
 
-            layer_scale = self.layer_scalar.to(dtype=hidden_states.dtype)
-            residual_start_end = _timing_record_start(do_leaf_timing)
-            if torch.is_grad_enabled():
-                hidden_states = hidden_states * layer_scale
-            else:
-                hidden_states.mul_(layer_scale)
-            _timing_record_end(
-                timing_events, "gemma4_residual_scale", residual_start_end
-            )
+            if not ple_tail_fused:
+                layer_scale = self.layer_scalar.to(dtype=hidden_states.dtype)
+                residual_start_end = _timing_record_start(do_leaf_timing)
+                if torch.is_grad_enabled():
+                    hidden_states = hidden_states * layer_scale
+                else:
+                    hidden_states.mul_(layer_scale)
+                _timing_record_end(
+                    timing_events, "gemma4_residual_scale", residual_start_end
+                )
             if finite_trace is not None:
                 _record_gemma4_prefill_finite_trace(
                     finite_trace, self.layer_idx, "layer.output", hidden_states
