@@ -54,6 +54,8 @@ def test_e2b_l4_policy_preserves_measured_multi_step_triton_path():
         (521, 256),
         (2057, 512),
     )
+    assert policy.gemma4_e2b_b8_prefill_ple_tail is True
+    assert policy.gemma4_e2b_b8_prefill_ple_tail_sequences == (2057,)
     assert policy.gemma4_bf16_fused_gateup_rows == ()
     assert policy.gemma4_bf16_deepfusion_rows == ()
     assert policy.gemma4_bf16_cublas_gateup_rows == (8,)
@@ -89,6 +91,8 @@ def test_e4b_l4_policy_preserves_measured_step_and_reuse_path():
     assert policy.gemma4_e2b_b8_prefill_dense_bridge_warps == ()
     assert policy.gemma4_e2b_b8_prefill_gated_activation is False
     assert policy.gemma4_e2b_b8_prefill_gated_activation_blocks == ()
+    assert policy.gemma4_e2b_b8_prefill_ple_tail is False
+    assert policy.gemma4_e2b_b8_prefill_ple_tail_sequences == ()
     assert policy.gemma4_bf16_fused_gateup_rows == ()
     assert policy.gemma4_bf16_deepfusion_rows == ()
     assert policy.gemma4_bf16_cublas_gateup_rows == ()
@@ -123,6 +127,8 @@ def test_gemma4_policy_is_not_promoted_to_unmeasured_hardware():
     assert policy.gemma4_e2b_b8_prefill_dense_bridge_warps == ()
     assert policy.gemma4_e2b_b8_prefill_gated_activation is False
     assert policy.gemma4_e2b_b8_prefill_gated_activation_blocks == ()
+    assert policy.gemma4_e2b_b8_prefill_ple_tail is False
+    assert policy.gemma4_e2b_b8_prefill_ple_tail_sequences == ()
     assert policy.gemma4_bf16_fused_gateup_rows == ()
     assert policy.gemma4_bf16_deepfusion_rows == ()
     assert policy.gemma4_bf16_cublas_gateup_rows == ()

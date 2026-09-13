@@ -10024,6 +10024,7 @@ class LlamaDecoderLayer(nn.Module):
         # add + layer scale in one existing Triton kernel.  Kept separate from
         # the attention bridge so each memory-bound boundary is gated alone.
         self._gemma4_e2b_prefill_ple_tail_enabled = False
+        self._gemma4_e2b_prefill_ple_tail_sequences = set()
         self._gemma4_e2b_prefill_ple_tail_hits = 0
         self._gemma4_e2b_prefill_ple_tail_runtime_disabled = False
         self._gemma4_e2b_prefill_ple_tail_failure = ""
@@ -10774,6 +10775,11 @@ class LlamaDecoderLayer(nn.Module):
                     and ple.ndim == 3
                     and int(ple.shape[0]) == 8
                     and int(ple.shape[1]) in (521, 2057)
+                    and (
+                        not self._gemma4_e2b_prefill_ple_tail_sequences
+                        or int(ple.shape[1])
+                        in self._gemma4_e2b_prefill_ple_tail_sequences
+                    )
                     and int(ple.shape[2]) == 1536
                 )
                 if use_prefill_ple_tail:
@@ -11764,6 +11770,19 @@ class MegaGemmLlama(nn.Module):
                 (),
             )
         }
+        e2b_b8_prefill_ple_tail = policy_bool(
+            self,
+            "MEGAGEMM_GEMMA4_E2B_B8_PREFILL_PLE_TAIL",
+            "gemma4_e2b_b8_prefill_ple_tail",
+        )
+        e2b_b8_prefill_ple_tail_sequences = {
+            int(sequence_len)
+            for sequence_len in getattr(
+                self.runtime_policy,
+                "gemma4_e2b_b8_prefill_ple_tail_sequences",
+                (),
+            )
+        }
         for layer in self.layers:
             attention = getattr(layer, "self_attn", None)
             if attention is not None:
@@ -11791,6 +11810,14 @@ class MegaGemmLlama(nn.Module):
                 )
                 layer._gemma4_e2b_prefill_dense_bridge_warps_by_sequence = dict(
                     e2b_b8_prefill_dense_bridge_warps
+                )
+            if hasattr(layer, "_gemma4_e2b_prefill_ple_tail_enabled"):
+                layer._gemma4_e2b_prefill_ple_tail_enabled = bool(
+                    e2b_b8_prefill_ple_tail
+                    and e2b_b8_prefill_ple_tail_sequences
+                )
+                layer._gemma4_e2b_prefill_ple_tail_sequences = set(
+                    e2b_b8_prefill_ple_tail_sequences
                 )
             mlp = getattr(layer, "mlp", None)
             if mlp is not None and hasattr(
@@ -12862,6 +12889,73 @@ class MegaGemmLlama(nn.Module):
             )
             if failure and not gemma4_e2b_prefill_dense_bridge_failure:
                 gemma4_e2b_prefill_dense_bridge_failure = failure
+        gemma4_e2b_prefill_ple_tail_layers = [
+            layer
+            for layer in self.layers
+            if hasattr(layer, "_gemma4_e2b_prefill_ple_tail_enabled")
+        ]
+        gemma4_e2b_prefill_ple_tail_enabled_layers = sum(
+            int(
+                bool(
+                    getattr(
+                        layer,
+                        "_gemma4_e2b_prefill_ple_tail_enabled",
+                        False,
+                    )
+                )
+            )
+            for layer in gemma4_e2b_prefill_ple_tail_layers
+        )
+        gemma4_e2b_prefill_ple_tail_sequences = sorted(
+            {
+                int(sequence_len)
+                for layer in gemma4_e2b_prefill_ple_tail_layers
+                if getattr(
+                    layer,
+                    "_gemma4_e2b_prefill_ple_tail_enabled",
+                    False,
+                )
+                for sequence_len in getattr(
+                    layer,
+                    "_gemma4_e2b_prefill_ple_tail_sequences",
+                    set(),
+                )
+            }
+        )
+        gemma4_e2b_prefill_ple_tail_hits = sum(
+            int(getattr(layer, "_gemma4_e2b_prefill_ple_tail_hits", 0))
+            for layer in gemma4_e2b_prefill_ple_tail_layers
+        )
+        gemma4_e2b_prefill_ple_tail_disabled_layers = sum(
+            int(
+                bool(
+                    getattr(
+                        layer,
+                        "_gemma4_e2b_prefill_ple_tail_runtime_disabled",
+                        False,
+                    )
+                )
+            )
+            for layer in gemma4_e2b_prefill_ple_tail_layers
+        )
+        gemma4_e2b_prefill_ple_tail_failure = next(
+            (
+                str(
+                    getattr(
+                        layer,
+                        "_gemma4_e2b_prefill_ple_tail_failure",
+                        "",
+                    )
+                )
+                for layer in gemma4_e2b_prefill_ple_tail_layers
+                if getattr(
+                    layer,
+                    "_gemma4_e2b_prefill_ple_tail_failure",
+                    "",
+                )
+            ),
+            "",
+        )
         qwen3_moe_experts = [
             mlp.experts
             for mlp in mlp_layers
@@ -14245,6 +14339,24 @@ class MegaGemmLlama(nn.Module):
             ),
             "gemma4_e2b_b8_prefill_dense_bridge_failure": (
                 gemma4_e2b_prefill_dense_bridge_failure
+            ),
+            "gemma4_e2b_b8_prefill_ple_tail_enabled": bool(
+                gemma4_e2b_prefill_ple_tail_enabled_layers > 0
+            ),
+            "gemma4_e2b_b8_prefill_ple_tail_enabled_layers": int(
+                gemma4_e2b_prefill_ple_tail_enabled_layers
+            ),
+            "gemma4_e2b_b8_prefill_ple_tail_sequences": list(
+                gemma4_e2b_prefill_ple_tail_sequences
+            ),
+            "gemma4_e2b_b8_prefill_ple_tail_hits": int(
+                gemma4_e2b_prefill_ple_tail_hits
+            ),
+            "gemma4_e2b_b8_prefill_ple_tail_disabled_layers": int(
+                gemma4_e2b_prefill_ple_tail_disabled_layers
+            ),
+            "gemma4_e2b_b8_prefill_ple_tail_failure": (
+                gemma4_e2b_prefill_ple_tail_failure
             ),
             "gemma4_long_sliding_prefill_enabled": bool(
                 _GEMMA4_LONG_SLIDING_PREFILL

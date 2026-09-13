@@ -48,6 +48,8 @@ class RuntimePolicy:
     gemma4_e2b_b8_prefill_dense_bridge_warps: tuple[tuple[int, int], ...] = ()
     gemma4_e2b_b8_prefill_gated_activation: bool = False
     gemma4_e2b_b8_prefill_gated_activation_blocks: tuple[tuple[int, int], ...] = ()
+    gemma4_e2b_b8_prefill_ple_tail: bool = False
+    gemma4_e2b_b8_prefill_ple_tail_sequences: tuple[int, ...] = ()
     gemma4_bf16_fused_gateup_rows: tuple[int, ...] = ()
     gemma4_bf16_deepfusion_rows: tuple[int, ...] = ()
     gemma4_bf16_cublas_gateup_rows: tuple[int, ...] = ()
@@ -125,6 +127,8 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
                 (521, 256),
                 (2057, 512),
             ),
+            gemma4_e2b_b8_prefill_ple_tail=True,
+            gemma4_e2b_b8_prefill_ple_tail_sequences=(2057,),
             gemma4_bf16_cublas_gateup_rows=(8,),
             gemma4_bf16_cublas_down_rows=(8,),
             reason=(
@@ -176,7 +180,10 @@ def resolve_runtime_policy(config: Any, device_name: str = "") -> RuntimePolicy:
                 "time by 3.85% and 6.18%; the exact-token dense prefill "
                 "bridge gate promotes W4 only for B8/S2057 after improving "
                 "prefill and wall time by 1.35% and 1.33%, while S521 remains "
-                "on the existing unfused path"
+                "on the existing unfused path; the exact-token PLE-tail gate "
+                "promotes fused post-PLE RMSNorm, residual add, and layer "
+                "scale only for B8/S2057 after improving median prefill by "
+                "1.19% and wall time by 1.13%, while S521 remains unchanged"
             ),
         )
     if topology == (42, 2560, 8, 2):

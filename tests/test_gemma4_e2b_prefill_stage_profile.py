@@ -63,6 +63,11 @@ def _sample(repeat: int, offset: float = 0.0):
             "dense_bridge_hits": 35 * repeat,
             "dense_bridge_disabled_layers": 0,
             "dense_bridge_failure": "",
+            "ple_tail_enabled_layers": 35,
+            "ple_tail_sequences": [2057],
+            "ple_tail_hits": 35 * repeat,
+            "ple_tail_disabled_layers": 0,
+            "ple_tail_failure": "",
             "implicit_causal_batches": repeat,
             "vectorized_kv_hits": 15 * repeat,
         },
@@ -127,6 +132,15 @@ def test_route_audit_rejects_stale_dense_bridge_dispatch():
     audit = module.audit_production_prefill_routes(samples)
     assert audit["passed"] is False
     assert any("dense_bridge_warps" in error for error in audit["errors"])
+
+
+def test_route_audit_rejects_stale_ple_tail_dispatch():
+    module = _load_module()
+    samples = [_sample(1), _sample(2), _sample(3)]
+    samples[1]["prefill_routes"]["ple_tail_sequences"] = [521, 2057]
+    audit = module.audit_production_prefill_routes(samples)
+    assert audit["passed"] is False
+    assert any("ple_tail_sequences" in error for error in audit["errors"])
 
 
 def test_colab_harness_uses_drive_directly_without_vllm_or_git_sync():

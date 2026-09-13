@@ -131,6 +131,9 @@ def _numeric_preflight(layer) -> dict[str, Any]:
 def _apply_case(layers: list[Any], enabled: bool) -> None:
     for layer in layers:
         layer._gemma4_e2b_prefill_ple_tail_enabled = enabled
+        # The frontier deliberately measures both S521 and S2057. Production
+        # policy is sequence-scoped, so clear its filter inside this A/B gate.
+        layer._gemma4_e2b_prefill_ple_tail_sequences = set()
         layer._gemma4_e2b_prefill_ple_tail_hits = 0
         layer._gemma4_e2b_prefill_ple_tail_runtime_disabled = False
         layer._gemma4_e2b_prefill_ple_tail_failure = ""

@@ -1568,6 +1568,41 @@ def test_gemma4_e2b_prefill_dense_bridge_policy_is_sequence_scoped():
         for layer in model.layers
     )
 
+
+def test_gemma4_e2b_prefill_ple_tail_policy_is_sequence_scoped():
+    from megagemm.models.runtime_policy import RuntimePolicy
+
+    config = LlamaConfig.from_dict(_tiny_gemma4_config_dict())
+    model = MegaGemmLlama(config).eval()
+    policy = RuntimePolicy(
+        name="gemma4-e2b-l4",
+        hardware="NVIDIA L4",
+        gemma4_e2b_b8_prefill_ple_tail=True,
+        gemma4_e2b_b8_prefill_ple_tail_sequences=(2057,),
+    )
+
+    with mock.patch(
+        "megagemm.models.llama.resolve_runtime_policy",
+        return_value=policy,
+    ):
+        model._refresh_gemma4_runtime_buffers(device="cpu", dtype=torch.float32)
+
+    assert all(
+        layer._gemma4_e2b_prefill_ple_tail_enabled for layer in model.layers
+    )
+    assert all(
+        layer._gemma4_e2b_prefill_ple_tail_sequences == {2057}
+        for layer in model.layers
+    )
+
+    stats = model.decode_runtime_stats()
+    assert stats["gemma4_e2b_b8_prefill_ple_tail_enabled"] is True
+    assert stats["gemma4_e2b_b8_prefill_ple_tail_enabled_layers"] == len(
+        model.layers
+    )
+    assert stats["gemma4_e2b_b8_prefill_ple_tail_sequences"] == [2057]
+
+
 def test_gemma4_uniform_batch_vectorizes_kv_and_projects_only_last_tokens():
     torch.manual_seed(0)
     config = LlamaConfig.from_dict(_tiny_gemma4_config_dict())

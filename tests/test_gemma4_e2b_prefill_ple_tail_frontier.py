@@ -18,12 +18,21 @@ def _load_benchmark():
 def test_model_route_is_opt_in_exact_shape_and_keeps_gemms():
     source = (ROOT / "megagemm" / "models" / "llama.py").read_text(encoding="utf-8")
     assert "self._gemma4_e2b_prefill_ple_tail_enabled = False" in source
+    assert "self._gemma4_e2b_prefill_ple_tail_sequences = set()" in source
     assert "and int(ple.shape[0]) == 8" in source
     assert "and int(ple.shape[1]) in (521, 2057)" in source
     assert "and int(ple.shape[2]) == 1536" in source
     assert "self._gemma4_e2b_prefill_ple_tail_hits += 1" in source
     assert "rmsnorm_triton_residual_scale_next(" in source
     assert "if not ple_tail_fused:" in source
+
+
+def test_runtime_policy_promotes_only_long_shape():
+    source = (ROOT / "megagemm" / "models" / "runtime_policy.py").read_text(
+        encoding="utf-8"
+    )
+    assert "gemma4_e2b_b8_prefill_ple_tail=True" in source
+    assert "gemma4_e2b_b8_prefill_ple_tail_sequences=(2057,)" in source
 
 
 def _samples(production: float, candidate: list[float]):
