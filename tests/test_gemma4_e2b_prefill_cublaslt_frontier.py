@@ -32,6 +32,23 @@ def test_candidate_maps_keep_algorithms_shape_specific():
     assert all(all(key[0] == 2057 for key in row) for row in maps)
 
 
+def test_down_candidate_maps_use_input_size_not_gateup_output_size():
+    module = _load_benchmark()
+    screen = {}
+    for sequence_len in (521, 2057):
+        for input_features in (6144, 12288):
+            screen[f"s{sequence_len}_k{input_features}"] = {
+                "top_algorithms": [
+                    {"algorithm_index": 2},
+                    {"algorithm_index": 5},
+                ]
+            }
+    maps = module._candidate_maps(screen, 2057, "down")
+    assert len(maps) == 4
+    assert maps[0] == {(2057, 6144): 2, (2057, 12288): 2}
+    assert module._screen_key("down", 521, 6144) == "s521_k6144"
+
+
 def test_model_route_is_exactly_guarded_and_falls_back():
     source = (ROOT / "megagemm" / "models" / "llama.py").read_text(
         encoding="utf-8"
@@ -42,6 +59,11 @@ def test_model_route_is_exactly_guarded_and_falls_back():
     assert "and gate_up_out_features in (12288, 24576)" in source
     assert "self._gemma4_e2b_prefill_cublaslt_gateup_hits += 1" in source
     assert "gate_up = _prefill_linear(" in source
+    assert "self._gemma4_e2b_prefill_cublaslt_down_enabled = False" in source
+    assert "and down_sequence_len in (521, 2057)" in source
+    assert "and down_input_features in (6144, 12288)" in source
+    assert "and int(down_weight.shape[0]) == 1536" in source
+    assert "self._gemma4_e2b_prefill_cublaslt_down_hits += 1" in source
 
 
 def test_focused_extension_can_be_built_without_unrelated_native_modules():
@@ -68,6 +90,8 @@ def test_colab_harness_uses_drive_and_ephemeral_build_only():
     assert "git pull" not in source
     assert "vllm" not in source.lower()
     assert "zip" not in source.lower()
+    assert 'TARGET="${TARGET:-gateup}"' in source
+    assert '--target "$TARGET"' in source
 
 
 def test_frontier_loads_one_model_and_uses_full_model_as_promotion_evidence():

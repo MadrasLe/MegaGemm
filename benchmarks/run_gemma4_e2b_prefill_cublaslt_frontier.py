@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """One-load full-model cuBLASLt frontier for Gemma 4 E2B/L4 B8 prefill.
 
-The frontier first screens explicit cuBLASLt heuristic indices on the four
-exact gate-up GEMMs used by B8/P512 and B8/P2048.  It then rotates the best
-algorithm combinations against production inside the same loaded model.  Only
-the full-model phase can recommend promotion; the per-GEMM screen is a search
-stage, not performance evidence by itself.
+The frontier screens explicit cuBLASLt heuristics for either the gate-up or
+down-projection GEMMs, then rotates the best shape-specific combinations
+against production inside the same loaded model.  Only the full-model phase
+can recommend promotion; the per-GEMM screen is candidate search, not
+performance evidence by itself.
 """
 
 from __future__ import annotations
@@ -34,9 +34,21 @@ from benchmarks.run_gemma4_e2b_phase_split import (
 
 
 PROMPT_TO_SEQUENCE = {512: 521, 2048: 2057}
-OUTPUT_FEATURES = (12288, 24576)
+TARGET_FEATURES = {
+    "gateup": (12288, 24576),
+    "down": (6144, 12288),
+}
+TARGET_COUNTS = {
+    "gateup": {12288: 15, 24576: 20},
+    "down": {6144: 15, 12288: 20},
+}
 EXPECTED_DENSE_LAYERS = 35
 MAX_ABS_ERROR = 0.25
+
+
+def _screen_key(target: str, sequence_len: int, feature_size: int) -> str:
+    axis = "n" if target == "gateup" else "k"
+    return f"s{sequence_len}_{axis}{feature_size}"
 
 
 def _median(values: list[float]) -> float:
@@ -66,32 +78,47 @@ def _measure(
     return samples
 
 
-def _mlp_modules(model) -> list[Any]:
+def _mlp_modules(model, target: str = "gateup") -> list[Any]:
+    route_attr = f"_gemma4_e2b_prefill_cublaslt_{target}_enabled"
     modules = [
         module
         for module in model.modules()
-        if hasattr(module, "_gemma4_e2b_prefill_cublaslt_gateup_enabled")
+        if hasattr(module, route_attr)
     ]
+    feature_sizes = TARGET_FEATURES[target]
     counts = {
-        output_features: sum(
-            int(module.gate_up_proj.weight.shape[0]) == output_features
+        feature_size: sum(
+            (
+                int(module.gate_up_proj.weight.shape[0])
+                if target == "gateup"
+                else int(module.down_proj.weight.shape[1])
+            )
+            == feature_size
             for module in modules
         )
-        for output_features in OUTPUT_FEATURES
+        for feature_size in feature_sizes
     }
-    if len(modules) != EXPECTED_DENSE_LAYERS or counts != {12288: 15, 24576: 20}:
+    if len(modules) != EXPECTED_DENSE_LAYERS or counts != TARGET_COUNTS[target]:
         raise RuntimeError(
-            "unexpected E2B MLP topology: "
-            f"total={len(modules)} output_feature_counts={counts}"
+            f"unexpected E2B {target} topology: "
+            f"total={len(modules)} feature_counts={counts}"
         )
     return modules
 
 
-def _representative_weights(modules: list[Any]) -> dict[int, Any]:
+def _representative_weights(
+    modules: list[Any],
+    target: str = "gateup",
+) -> dict[int, Any]:
     weights: dict[int, Any] = {}
     for module in modules:
-        weight = module.gate_up_proj.weight
-        weights.setdefault(int(weight.shape[0]), weight)
+        weight = (
+            module.gate_up_proj.weight
+            if target == "gateup"
+            else module.down_proj.weight
+        )
+        feature_size = int(weight.shape[0] if target == "gateup" else weight.shape[1])
+        weights.setdefault(feature_size, weight)
     return weights
 
 
@@ -111,8 +138,10 @@ def _valid_algorithm(row: dict[str, Any], maximum_spread: float) -> bool:
 
 def _screen_shape(
     *,
+    target: str = "gateup",
     sequence_len: int,
-    output_features: int,
+    feature_size: int | None = None,
+    output_features: int | None = None,
     weight,
     maximum_algorithms: int,
     warmups: int,
@@ -125,17 +154,25 @@ def _screen_shape(
         cublaslt_bf16_linear_cuda,
     )
 
+    # ``output_features`` is retained as a compatibility alias for callers of
+    # the original gate-up-only frontier.
+    if feature_size is None:
+        if output_features is None:
+            raise ValueError("feature_size is required")
+        feature_size = int(output_features)
+    input_features = 1536 if target == "gateup" else int(feature_size)
+    result_features = int(feature_size) if target == "gateup" else 1536
     rows = 8 * sequence_len
     generator = torch.Generator(device="cuda")
-    generator.manual_seed(20260912 + sequence_len + output_features)
+    generator.manual_seed(20260912 + sequence_len + int(feature_size))
     x = torch.empty(
-        (rows, 1536),
+        (rows, input_features),
         device="cuda",
         dtype=torch.bfloat16,
     ).normal_(mean=0.0, std=0.2, generator=generator)
     weight_t = weight.t()
     reference = torch.empty(
-        (rows, output_features),
+        (rows, result_features),
         device="cuda",
         dtype=torch.bfloat16,
     )
@@ -206,11 +243,12 @@ def _screen_shape(
     torch.cuda.empty_cache()
     return {
         "shape": {
+            "target": target,
             "batch_size": 8,
             "sequence_len": sequence_len,
             "m": rows,
-            "k": 1536,
-            "n": output_features,
+            "k": input_features,
+            "n": result_features,
             "dtype": "bf16",
         },
         "algorithm_count": algorithm_count,
@@ -230,31 +268,38 @@ def _screen_shape(
     }
 
 
-def _candidate_maps(screen: dict[str, Any], sequence_len: int) -> list[dict[Any, int]]:
+def _candidate_maps(
+    screen: dict[str, Any],
+    sequence_len: int,
+    target: str = "gateup",
+) -> list[dict[Any, int]]:
     choices: dict[int, list[int]] = {}
-    for output_features in OUTPUT_FEATURES:
-        row = screen[f"s{sequence_len}_n{output_features}"]
-        choices[output_features] = [
+    feature_sizes = TARGET_FEATURES[target]
+    for feature_size in feature_sizes:
+        row = screen[_screen_key(target, sequence_len, feature_size)]
+        choices[feature_size] = [
             int(item["algorithm_index"])
             for item in row["top_algorithms"]
         ]
-        if not choices[output_features]:
+        if not choices[feature_size]:
             raise RuntimeError(
-                f"no valid cuBLASLt algorithms for S{sequence_len}/N{output_features}"
+                "no valid cuBLASLt algorithms for "
+                f"{_screen_key(target, sequence_len, feature_size)}"
             )
-        if len(choices[output_features]) == 1:
-            choices[output_features].append(choices[output_features][0])
+        if len(choices[feature_size]) == 1:
+            choices[feature_size].append(choices[feature_size][0])
 
+    first, second = feature_sizes
     maps = [
         {
-            (sequence_len, 12288): small,
-            (sequence_len, 24576): large,
+            (sequence_len, first): small,
+            (sequence_len, second): large,
         }
         for small, large in (
-            (choices[12288][0], choices[24576][0]),
-            (choices[12288][1], choices[24576][0]),
-            (choices[12288][0], choices[24576][1]),
-            (choices[12288][1], choices[24576][1]),
+            (choices[first][0], choices[second][0]),
+            (choices[first][1], choices[second][0]),
+            (choices[first][0], choices[second][1]),
+            (choices[first][1], choices[second][1]),
         )
     ]
     unique: list[dict[Any, int]] = []
@@ -267,13 +312,18 @@ def _candidate_maps(screen: dict[str, Any], sequence_len: int) -> list[dict[Any,
     return unique
 
 
-def _apply_case(modules: list[Any], algorithms: dict[Any, int] | None) -> None:
+def _apply_case(
+    modules: list[Any],
+    algorithms: dict[Any, int] | None,
+    target: str = "gateup",
+) -> None:
+    prefix = f"_gemma4_e2b_prefill_cublaslt_{target}"
     for module in modules:
-        module._gemma4_e2b_prefill_cublaslt_gateup_enabled = algorithms is not None
-        module._gemma4_e2b_prefill_cublaslt_gateup_algorithms = dict(algorithms or {})
-        module._gemma4_e2b_prefill_cublaslt_gateup_hits = 0
-        module._gemma4_e2b_prefill_cublaslt_gateup_runtime_disabled = False
-        module._gemma4_e2b_prefill_cublaslt_gateup_failure = ""
+        setattr(module, f"{prefix}_enabled", algorithms is not None)
+        setattr(module, f"{prefix}_algorithms", dict(algorithms or {}))
+        setattr(module, f"{prefix}_hits", 0)
+        setattr(module, f"{prefix}_runtime_disabled", False)
+        setattr(module, f"{prefix}_failure", "")
 
 
 def _run_once(
@@ -285,8 +335,9 @@ def _run_once(
     case: str,
     algorithms: dict[Any, int] | None,
     repeat: int,
+    target: str = "gateup",
 ) -> dict[str, Any]:
-    _apply_case(modules, algorithms)
+    _apply_case(modules, algorithms, target)
     matrix.sync_cuda()
     result = runner(prompts, 1)
     matrix.sync_cuda()
@@ -298,19 +349,17 @@ def _run_once(
     extra = dict(result.get("extra") or {})
     scheduler = dict(extra.get("scheduler_stats") or {})
     runtime = dict(extra.get("decode_runtime_stats") or {})
-    hits = sum(
-        int(module._gemma4_e2b_prefill_cublaslt_gateup_hits)
-        for module in modules
-    )
+    prefix = f"_gemma4_e2b_prefill_cublaslt_{target}"
+    hits = sum(int(getattr(module, f"{prefix}_hits")) for module in modules)
     disabled = sum(
-        bool(module._gemma4_e2b_prefill_cublaslt_gateup_runtime_disabled)
+        bool(getattr(module, f"{prefix}_runtime_disabled"))
         for module in modules
     )
     failures = sorted(
         {
-            str(module._gemma4_e2b_prefill_cublaslt_gateup_failure)
+            str(getattr(module, f"{prefix}_failure"))
             for module in modules
-            if module._gemma4_e2b_prefill_cublaslt_gateup_failure
+            if getattr(module, f"{prefix}_failure")
         }
     )
     return {
@@ -319,7 +368,7 @@ def _run_once(
         "repeat": repeat,
         "algorithms": (
             {
-                f"s{key[0]}_n{key[1]}": int(value)
+                _screen_key(target, key[0], key[1]): int(value)
                 for key, value in sorted(algorithms.items())
             }
             if algorithms is not None
@@ -358,6 +407,7 @@ def _summarize(
     maximum_spread: float,
     minimum_prefill_speedup: float,
     minimum_wall_speedup: float,
+    target: str = "gateup",
 ) -> dict[str, Any]:
     shape_policy: dict[str, Any] = {}
     rows: dict[str, Any] = {}
@@ -443,6 +493,7 @@ def _summarize(
         if value["decision"] == "PROMOTE_CUBLASLT"
     ]
     return {
+        "target": target,
         "decision": "PROMOTE_SHAPE_DISPATCH" if promoted else "KEEP_TORCH_MM",
         "apply_change": bool(promoted),
         "promoted_shapes": promoted,
@@ -490,10 +541,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     engine = getattr(runner, "_megagemm_engine", None)
     if engine is None:
         raise RuntimeError("MegaGemm runner did not expose its loaded engine")
-    modules = _mlp_modules(engine.model)
-    weights = _representative_weights(modules)
+    modules = _mlp_modules(engine.model, args.target)
+    weights = _representative_weights(modules, args.target)
 
     print("Gemma 4 E2B/L4 B8 prefill cuBLASLt frontier", flush=True)
+    print(f"  target: {args.target}", flush=True)
     print("  four exact GEMM screens + full-model final gate", flush=True)
     print("  workloads: P512/P2048, O1, natural greedy tokens", flush=True)
     print("  model loads: 1; profiler: disabled", flush=True)
@@ -501,14 +553,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     screen: dict[str, Any] = {}
     for prompt_tokens in prompts_requested:
         sequence_len = PROMPT_TO_SEQUENCE[prompt_tokens]
-        for output_features in OUTPUT_FEATURES:
-            key = f"s{sequence_len}_n{output_features}"
+        for feature_size in TARGET_FEATURES[args.target]:
+            key = _screen_key(args.target, sequence_len, feature_size)
             print(f"Screen {key}", flush=True)
             with torch.inference_mode():
                 screen[key] = _screen_shape(
+                    target=args.target,
                     sequence_len=sequence_len,
-                    output_features=output_features,
-                    weight=weights[output_features],
+                    feature_size=feature_size,
+                    weight=weights[feature_size],
                     maximum_algorithms=args.maximum_algorithms,
                     warmups=args.screen_warmups,
                     repeats=args.screen_repeats,
@@ -522,7 +575,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     cases_by_prompt: dict[int, list[tuple[str, dict[Any, int] | None]]] = {}
     for prompt_tokens in prompts_requested:
         sequence_len = PROMPT_TO_SEQUENCE[prompt_tokens]
-        candidates = _candidate_maps(screen, sequence_len)
+        candidates = _candidate_maps(screen, sequence_len, args.target)
         cases_by_prompt[prompt_tokens] = [
             ("production", None),
             *[
@@ -542,6 +595,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 case=case,
                 algorithms=algorithms,
                 repeat=0,
+                target=args.target,
             )
 
     schedule = [
@@ -565,6 +619,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 case=case,
                 algorithms=algorithms,
                 repeat=repeat,
+                target=args.target,
             )
             samples.append(sample)
             print(
@@ -580,10 +635,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         maximum_spread=args.maximum_spread,
         minimum_prefill_speedup=args.minimum_prefill_speedup,
         minimum_wall_speedup=args.minimum_wall_speedup,
+        target=args.target,
     )
     payload = {
-        "benchmark": "gemma4_e2b_l4_b8_prefill_cublaslt_frontier",
-        "schema_version": 1,
+        "benchmark": f"gemma4_e2b_l4_b8_prefill_cublaslt_{args.target}_frontier",
+        "schema_version": 2,
+        "target": args.target,
         "model": args.model,
         "hardware_label": "1xl4",
         "dtype": "bf16",
@@ -616,6 +673,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--target", choices=sorted(TARGET_FEATURES), default="gateup")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--tokenizer")
     parser.add_argument("--batch-size", type=int, default=8)

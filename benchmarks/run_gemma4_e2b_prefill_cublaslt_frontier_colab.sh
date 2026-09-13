@@ -5,8 +5,13 @@ set -euo pipefail
 # path.  The focused cuBLASLt extension is built under /tmp and leaves no native
 # build products in the repository or Drive.
 REPO="${REPO:-/content/drive/MyDrive/mg/MGRrmsnorm}"
-RUN_ID="${RUN_ID:-gemma4_e2b_prefill_cublaslt_$(date -u +%Y%m%dT%H%M%SZ)}"
-OUT="${OUT:-$REPO/bench_results/gemma4_e2b_prefill_cublaslt/$RUN_ID/frontier.json}"
+TARGET="${TARGET:-gateup}"
+[[ "$TARGET" == "gateup" || "$TARGET" == "down" ]] || {
+  echo "ERRO: TARGET deve ser gateup ou down."
+  exit 2
+}
+RUN_ID="${RUN_ID:-gemma4_e2b_prefill_cublaslt_${TARGET}_$(date -u +%Y%m%dT%H%M%SZ)}"
+OUT="${OUT:-$REPO/bench_results/gemma4_e2b_prefill_cublaslt_${TARGET}/$RUN_ID/frontier.json}"
 
 cd "$REPO"
 
@@ -54,6 +59,7 @@ PY
 
 mkdir -p "$(dirname "$OUT")"
 python benchmarks/run_gemma4_e2b_prefill_cublaslt_frontier.py \
+  --target "$TARGET" \
   --model google/gemma-4-E2B-it \
   --batch-size 8 \
   --prompt-tokens 512,2048 \

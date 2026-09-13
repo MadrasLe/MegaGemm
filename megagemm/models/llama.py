@@ -6612,6 +6612,14 @@ class LlamaMLP(nn.Module):
         self._gemma4_e2b_prefill_cublaslt_gateup_hits = 0
         self._gemma4_e2b_prefill_cublaslt_gateup_runtime_disabled = False
         self._gemma4_e2b_prefill_cublaslt_gateup_failure = ""
+        # Experimental exact-shape cuBLASLt down-projection route.  Keep this
+        # separate from gate-up because the E2B shapes and winning algorithms
+        # are unrelated: [B*S, 6144/12288] @ [6144/12288, 1536].
+        self._gemma4_e2b_prefill_cublaslt_down_enabled = False
+        self._gemma4_e2b_prefill_cublaslt_down_algorithms = {}
+        self._gemma4_e2b_prefill_cublaslt_down_hits = 0
+        self._gemma4_e2b_prefill_cublaslt_down_runtime_disabled = False
+        self._gemma4_e2b_prefill_cublaslt_down_failure = ""
         # Experimental fused gate/up GEMM + GeGLU prefill body.  The frontier
         # installs one explicit launch geometry; production remains disabled
         # until a loaded-model, natural-token gate promotes a shape policy.
@@ -6787,6 +6795,55 @@ class LlamaMLP(nn.Module):
     ) -> torch.Tensor:
         down_weight, down_bias = _linear_weight_bias(self.down_proj)
         down_start_end = _timing_record_start(do_prefill_stage_timing)
+        down_sequence_len = int(activated.shape[1]) if activated.ndim == 3 else 0
+        down_input_features = int(activated.shape[-1])
+        down_algorithm_key = (down_sequence_len, down_input_features)
+        use_prefill_cublaslt_down = bool(
+            self._gemma4_e2b_prefill_cublaslt_down_enabled
+            and not self._gemma4_e2b_prefill_cublaslt_down_runtime_disabled
+            and HAS_CUBLASLT_BF16_LINEAR
+            and callable(cublaslt_bf16_linear_cuda)
+            and down_weight is not None
+            and activated.is_cuda
+            and activated.dtype == torch.bfloat16
+            and not torch.is_grad_enabled()
+            and activated.ndim == 3
+            and int(activated.shape[0]) == 8
+            and down_sequence_len in (521, 2057)
+            and down_input_features in (6144, 12288)
+            and int(down_weight.shape[0]) == 1536
+            and down_algorithm_key
+            in self._gemma4_e2b_prefill_cublaslt_down_algorithms
+        )
+        if use_prefill_cublaslt_down:
+            try:
+                down_out = _get_prefill_out(
+                    self,
+                    "_fast_down_out",
+                    (*activated.shape[:-1], 1536),
+                    activated,
+                )
+                cublaslt_bf16_linear_cuda(
+                    activated.flatten(0, -2),
+                    down_weight,
+                    down_bias,
+                    out=down_out.flatten(0, -2),
+                    algorithm_index=int(
+                        self._gemma4_e2b_prefill_cublaslt_down_algorithms[
+                            down_algorithm_key
+                        ]
+                    ),
+                )
+            except Exception as exc:
+                self._gemma4_e2b_prefill_cublaslt_down_runtime_disabled = True
+                if not self._gemma4_e2b_prefill_cublaslt_down_failure:
+                    self._gemma4_e2b_prefill_cublaslt_down_failure = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            else:
+                self._gemma4_e2b_prefill_cublaslt_down_hits += 1
+                _timing_record_end(timing_events, "down_proj", down_start_end)
+                return down_out
         if _can_use_fast_gemv_for(
             "down",
             activated,
