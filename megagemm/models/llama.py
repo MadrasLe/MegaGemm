@@ -199,6 +199,7 @@ try:
     from ..kernels.deepfusion_mlp import (
         deepfusion_swiglu_down,
         gemma4_e2b_b8_geglu_down_tensorcore,
+        gemma4_e2b_b8_geglu_down_tensorcore_splitk,
         HAS_DEEPFUSION_MLP,
         deepfusion_mlp_prefers_triton_shape,
         deepfusion_runtime_config,
@@ -206,6 +207,7 @@ try:
 except Exception:
     deepfusion_swiglu_down = None
     gemma4_e2b_b8_geglu_down_tensorcore = None
+    gemma4_e2b_b8_geglu_down_tensorcore_splitk = None
     HAS_DEEPFUSION_MLP = False
     deepfusion_mlp_prefers_triton_shape = None
     deepfusion_runtime_config = None
@@ -11278,6 +11280,8 @@ class MegaGemmLlama(nn.Module):
         self._gemma4_flat_b8_gated_activation_bufs = None
         self._gemma4_flat_b8_tensorcore_down_enabled = False
         self._gemma4_flat_b8_tensorcore_down_config = (64, 32, 4, 2)
+        self._gemma4_flat_b8_tensorcore_down_split_k = 1
+        self._gemma4_flat_b8_tensorcore_splitk_bufs = None
         self._gemma4_flat_b8_tensorcore_down_hits = 0
         self._gemma4_flat_b8_tensorcore_down_runtime_disabled = False
         self._gemma4_flat_b8_tensorcore_down_failure = ""
@@ -14817,6 +14821,12 @@ class MegaGemmLlama(nn.Module):
             "gemma4_e2b_b8_tensorcore_down_config": list(
                 getattr(self, "_gemma4_flat_b8_tensorcore_down_config", ())
             ),
+            "gemma4_e2b_b8_tensorcore_down_split_k": int(
+                getattr(self, "_gemma4_flat_b8_tensorcore_down_split_k", 1)
+            ),
+            "gemma4_e2b_b8_tensorcore_splitk_workspace_ready": bool(
+                getattr(self, "_gemma4_flat_b8_tensorcore_splitk_bufs", None)
+            ),
             "gemma4_e2b_b8_tensorcore_down_hits": int(
                 getattr(self, "_gemma4_flat_b8_tensorcore_down_hits", 0)
             ),
@@ -17207,6 +17217,11 @@ class MegaGemmLlama(nn.Module):
                 _env_int("MEGAGEMM_GEMMA4_E2B_B8_TC_DOWN_WARPS", 4),
                 _env_int("MEGAGEMM_GEMMA4_E2B_B8_TC_DOWN_STAGES", 2),
             )
+            self._gemma4_flat_b8_tensorcore_down_split_k = _env_int(
+                "MEGAGEMM_GEMMA4_E2B_B8_TC_DOWN_SPLIT_K",
+                1,
+            )
+            self._gemma4_flat_b8_tensorcore_splitk_bufs = None
             self._gemma4_flat_dense_next_attn_norm_bufs = (
                 [
                     torch.empty(
@@ -17420,6 +17435,11 @@ class MegaGemmLlama(nn.Module):
                 self._flat_int8_x_buf = torch.empty(batch_size, max_k, dtype=torch.int8, device=device)
                 self._flat_int8_scale_buf = torch.empty(batch_size, 1, dtype=torch.float32, device=device)
             self._flat_bufs_batch = batch_size
+            if (
+                self._gemma4_flat_b8_tensorcore_down_enabled
+                and self._gemma4_flat_b8_tensorcore_down_split_k > 1
+            ):
+                self._prepare_gemma4_e2b_b8_tensorcore_splitk_buffers()
             return
         H = self._flat_hidden_size
         I = self._flat_intermediate_size
@@ -17545,6 +17565,39 @@ class MegaGemmLlama(nn.Module):
                 torch.cuda.empty_cache()
                 print("[MegaGemm] flat FP16 dequant cache OOM; falling back to W8A16 direct decode")
         self._flat_bufs_batch = batch_size
+
+    def _prepare_gemma4_e2b_b8_tensorcore_splitk_buffers(self) -> None:
+        """Allocate persistent FP32 partials for experimental split-K decode."""
+        current = getattr(self, "_gemma4_flat_b8_tensorcore_splitk_bufs", None)
+        if current is not None:
+            return
+        weights = list(getattr(self, "_flat_layer_weights", ()) or ())
+        gate_up_buffers = list(
+            getattr(self, "_gemma4_flat_gate_up_bufs", ()) or ()
+        )
+        if int(getattr(self, "_flat_bufs_batch", -1)) != 8:
+            raise RuntimeError("split-K workspace requires allocated B8 flat buffers")
+        if len(weights) != len(gate_up_buffers):
+            raise RuntimeError("split-K workspace cannot resolve Gemma4 layer buffers")
+        self._gemma4_flat_b8_tensorcore_splitk_bufs = [
+            torch.empty(
+                (8, 8, 1536),
+                device=gate_up_buffers[index].device,
+                dtype=torch.float32,
+            )
+            if (
+                not bool(lw.is_moe)
+                and int(lw.intermediate_size) == 12288
+                and tuple(gate_up_buffers[index].shape) == (8, 24576)
+                and lw.down_weight is not None
+                and tuple(lw.down_weight.shape) == (1536, 12288)
+            )
+            else None
+            for index, lw in enumerate(weights)
+        ]
+        if sum(item is not None for item in self._gemma4_flat_b8_tensorcore_splitk_bufs) != 20:
+            self._gemma4_flat_b8_tensorcore_splitk_bufs = None
+            raise RuntimeError("split-K workspace did not resolve all 20 E2B layers")
 
     def _gemma4_flat_baseline_down(self, gate_up: torch.Tensor, lw: _Gemma4FlatLayerWeights, layer_idx: int) -> torch.Tensor:
         gate = gate_up[:, :lw.intermediate_size]
@@ -18191,6 +18244,23 @@ class MegaGemmLlama(nn.Module):
         _timing_record_end(timing_events, "mlp_gate_up", mlp_gate_up_start_end)
 
         mlp_down_start_end = _timing_record_start(timing_events is not None)
+        tensorcore_split_k = int(
+            getattr(self, "_gemma4_flat_b8_tensorcore_down_split_k", 1)
+        )
+        tensorcore_splitk_bufs = getattr(
+            self,
+            "_gemma4_flat_b8_tensorcore_splitk_bufs",
+            None,
+        )
+        tensorcore_kernel_ready = bool(
+            callable(gemma4_e2b_b8_geglu_down_tensorcore)
+            if tensorcore_split_k == 1
+            else (
+                callable(gemma4_e2b_b8_geglu_down_tensorcore_splitk)
+                and tensorcore_splitk_bufs is not None
+                and tensorcore_splitk_bufs[layer_idx] is not None
+            )
+        )
         use_tensorcore_down = bool(
             not b1_gemv_down
             and getattr(
@@ -18203,7 +18273,7 @@ class MegaGemmLlama(nn.Module):
                 "_gemma4_flat_b8_tensorcore_down_runtime_disabled",
                 False,
             )
-            and callable(gemma4_e2b_b8_geglu_down_tensorcore)
+            and tensorcore_kernel_ready
             and gate_up.dtype == torch.bfloat16
             and tuple(gate_up.shape) == (8, 24576)
             and lw.down_weight is not None
@@ -18215,16 +18285,32 @@ class MegaGemmLlama(nn.Module):
                 self._gemma4_flat_b8_tensorcore_down_config
             )
             try:
-                down_out = gemma4_e2b_b8_geglu_down_tensorcore(
-                    gate_up,
-                    lw.down_weight,
-                    lw.down_bias,
-                    out=self._gemma4_flat_down_bufs[layer_idx],
-                    block_n=block_n,
-                    block_k=block_k,
-                    num_warps=num_warps,
-                    num_stages=num_stages,
-                )
+                if tensorcore_split_k == 1:
+                    down_out = gemma4_e2b_b8_geglu_down_tensorcore(
+                        gate_up,
+                        lw.down_weight,
+                        lw.down_bias,
+                        out=self._gemma4_flat_down_bufs[layer_idx],
+                        block_n=block_n,
+                        block_k=block_k,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                    )
+                else:
+                    down_out = gemma4_e2b_b8_geglu_down_tensorcore_splitk(
+                        gate_up,
+                        lw.down_weight,
+                        lw.down_bias,
+                        out=self._gemma4_flat_down_bufs[layer_idx],
+                        workspace=tensorcore_splitk_bufs[layer_idx][
+                            :tensorcore_split_k
+                        ],
+                        split_k=tensorcore_split_k,
+                        block_n=block_n,
+                        block_k=block_k,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                    )
             except Exception as exc:
                 self._gemma4_flat_b8_tensorcore_down_runtime_disabled = True
                 if not self._gemma4_flat_b8_tensorcore_down_failure:

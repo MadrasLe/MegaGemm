@@ -16,6 +16,17 @@ def test_tensorcore_mlp_kernel_is_exactly_guarded_to_e2b_b8_large_shape():
     assert "This deliberately has no generic fallback" in source
 
 
+def test_splitk_tensorcore_mlp_uses_fp32_partials_and_separate_reduction():
+    source = (ROOT / "megagemm" / "kernels" / "deepfusion_mlp.py").read_text(
+        encoding="utf-8"
+    )
+    assert "def gemma4_e2b_b8_geglu_down_tensorcore_splitk(" in source
+    assert "split_k not in (2, 4, 8)" in source
+    assert "workspace.dtype != torch.float32" in source
+    assert "_gemma4_e2b_b8_geglu_down_tensorcore_splitk_kernel" in source
+    assert "_gemma4_e2b_b8_geglu_down_tensorcore_splitk_reduce_kernel" in source
+
+
 def test_model_large_mlp_chain_has_counted_fallbacks():
     source = (ROOT / "megagemm" / "models" / "llama.py").read_text(
         encoding="utf-8"
@@ -23,6 +34,8 @@ def test_model_large_mlp_chain_has_counted_fallbacks():
     assert "use_tensorcore_down = bool(" in source
     assert "_gemma4_flat_b8_tensorcore_down_runtime_disabled = True" in source
     assert "_gemma4_flat_b8_tensorcore_down_hits += 1" in source
+    assert "_prepare_gemma4_e2b_b8_tensorcore_splitk_buffers" in source
+    assert "gemma4_e2b_b8_geglu_down_tensorcore_splitk(" in source
     assert "use_gated_activation = bool(" in source
     assert "_gemma4_flat_b8_gated_activation_runtime_disabled = True" in source
     assert "_gemma4_flat_b8_gated_activation_hits += 1" in source

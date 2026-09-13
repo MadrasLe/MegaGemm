@@ -74,6 +74,7 @@ class ComputeCase:
     mlp_tc_block_k: int = 32
     mlp_tc_warps: int = 4
     mlp_tc_stages: int = 2
+    mlp_tc_split_k: int = 1
     ple_conditioned: bool = False
     ple_block_size: int = 256
 
@@ -183,6 +184,50 @@ SCREEN_CASES = (
         "mlp_core",
         mlp_core_mode="tensorcore_down",
         mlp_tc_stages=3,
+    ),
+    # Split-K retains the best two single-CTA tiles while expanding 24 N tiles
+    # across enough CTAs to occupy all 58 L4 SMs.
+    ComputeCase(
+        "mlp_tc_bn64_bk32_w4_s3_sk2",
+        "mlp_core",
+        mlp_core_mode="tensorcore_down",
+        mlp_tc_stages=3,
+        mlp_tc_split_k=2,
+    ),
+    ComputeCase(
+        "mlp_tc_bn64_bk32_w4_s3_sk4",
+        "mlp_core",
+        mlp_core_mode="tensorcore_down",
+        mlp_tc_stages=3,
+        mlp_tc_split_k=4,
+    ),
+    ComputeCase(
+        "mlp_tc_bn64_bk32_w4_s3_sk8",
+        "mlp_core",
+        mlp_core_mode="tensorcore_down",
+        mlp_tc_stages=3,
+        mlp_tc_split_k=8,
+    ),
+    ComputeCase(
+        "mlp_tc_bn64_bk64_w4_s2_sk2",
+        "mlp_core",
+        mlp_core_mode="tensorcore_down",
+        mlp_tc_block_k=64,
+        mlp_tc_split_k=2,
+    ),
+    ComputeCase(
+        "mlp_tc_bn64_bk64_w4_s2_sk4",
+        "mlp_core",
+        mlp_core_mode="tensorcore_down",
+        mlp_tc_block_k=64,
+        mlp_tc_split_k=4,
+    ),
+    ComputeCase(
+        "mlp_tc_bn64_bk64_w4_s2_sk8",
+        "mlp_core",
+        mlp_core_mode="tensorcore_down",
+        mlp_tc_block_k=64,
+        mlp_tc_split_k=8,
     ),
     # PLE is a separate residual tail, but it belongs in the same full-model
     # optimization gate because it contributes to every E2B decode layer.
@@ -355,6 +400,7 @@ def _restore_mlp_state(model: Any, state: dict[str, Any]) -> None:
     model._gemma4_flat_b8_gated_activation_runtime_disabled = False
     model._gemma4_flat_b8_gated_activation_failure = ""
     model._gemma4_flat_b8_tensorcore_down_enabled = False
+    model._gemma4_flat_b8_tensorcore_down_split_k = 1
     model._gemma4_flat_b8_tensorcore_down_runtime_disabled = False
     model._gemma4_flat_b8_tensorcore_down_failure = ""
     model._gemma4_flat_ple_conditioned_gelu_enabled = False
@@ -415,12 +461,17 @@ def _apply_case(
             case.mlp_activation_block_size
         )
     elif case.mlp_core_mode == "tensorcore_down":
+        if int(case.mlp_tc_split_k) > 1:
+            model._prepare_gemma4_e2b_b8_tensorcore_splitk_buffers()
         model._gemma4_flat_b8_tensorcore_down_enabled = True
         model._gemma4_flat_b8_tensorcore_down_config = (
             int(case.mlp_tc_block_n),
             int(case.mlp_tc_block_k),
             int(case.mlp_tc_warps),
             int(case.mlp_tc_stages),
+        )
+        model._gemma4_flat_b8_tensorcore_down_split_k = int(
+            case.mlp_tc_split_k
         )
     model._gemma4_flat_ple_conditioned_gelu_enabled = bool(case.ple_conditioned)
     model._gemma4_flat_ple_conditioned_gelu_block_size = int(case.ple_block_size)
@@ -581,6 +632,7 @@ def _run_tensorcore_numeric_preflight(
     import torch.nn.functional as functional
     from megagemm.kernels.deepfusion_mlp import (
         gemma4_e2b_b8_geglu_down_tensorcore,
+        gemma4_e2b_b8_geglu_down_tensorcore_splitk,
     )
 
     config = {
@@ -588,26 +640,54 @@ def _run_tensorcore_numeric_preflight(
         "block_k": int(case.mlp_tc_block_k),
         "num_warps": int(case.mlp_tc_warps),
         "num_stages": int(case.mlp_tc_stages),
+        "split_k": int(case.mlp_tc_split_k),
     }
     rows: list[dict[str, Any]] = []
     with torch.inference_mode():
         for fixture in fixtures:
             first = torch.empty_like(fixture["reference"])
             second = torch.empty_like(first)
-            gemma4_e2b_b8_geglu_down_tensorcore(
-                fixture["gate_up"],
-                fixture["down_weight"],
-                fixture["down_bias"],
-                out=first,
-                **config,
-            )
-            gemma4_e2b_b8_geglu_down_tensorcore(
-                fixture["gate_up"],
-                fixture["down_weight"],
-                fixture["down_bias"],
-                out=second,
-                **config,
-            )
+            if case.mlp_tc_split_k == 1:
+                single_config = {
+                    key: value for key, value in config.items() if key != "split_k"
+                }
+                gemma4_e2b_b8_geglu_down_tensorcore(
+                    fixture["gate_up"],
+                    fixture["down_weight"],
+                    fixture["down_bias"],
+                    out=first,
+                    **single_config,
+                )
+                gemma4_e2b_b8_geglu_down_tensorcore(
+                    fixture["gate_up"],
+                    fixture["down_weight"],
+                    fixture["down_bias"],
+                    out=second,
+                    **single_config,
+                )
+            else:
+                first_workspace = torch.empty(
+                    (case.mlp_tc_split_k, 8, 1536),
+                    device=first.device,
+                    dtype=torch.float32,
+                )
+                second_workspace = torch.empty_like(first_workspace)
+                gemma4_e2b_b8_geglu_down_tensorcore_splitk(
+                    fixture["gate_up"],
+                    fixture["down_weight"],
+                    fixture["down_bias"],
+                    out=first,
+                    workspace=first_workspace,
+                    **config,
+                )
+                gemma4_e2b_b8_geglu_down_tensorcore_splitk(
+                    fixture["gate_up"],
+                    fixture["down_weight"],
+                    fixture["down_bias"],
+                    out=second,
+                    workspace=second_workspace,
+                    **config,
+                )
             torch.cuda.synchronize()
             candidate_fp32 = first.float()
             reference_fp32 = fixture["reference"].float()
@@ -721,6 +801,17 @@ def _route_errors(
         ]
         if runtime_stats.get("gemma4_e2b_b8_tensorcore_down_config") != expected_config:
             errors.append("Tensor Core GeGLU+down selected the wrong launch config")
+        if int(
+            runtime_stats.get("gemma4_e2b_b8_tensorcore_down_split_k") or 0
+        ) != int(case.mlp_tc_split_k):
+            errors.append("Tensor Core GeGLU+down selected the wrong split-K")
+        if (
+            int(case.mlp_tc_split_k) > 1
+            and not runtime_stats.get(
+                "gemma4_e2b_b8_tensorcore_splitk_workspace_ready"
+            )
+        ):
+            errors.append("Tensor Core split-K workspace is not ready")
     if case.ple_conditioned:
         if not delta["gemma4_ple_conditioned_gelu_decode_hits"]:
             errors.append("requested fused PLE conditioned GELU route produced no hits")
@@ -912,6 +1003,7 @@ def combine_family_winners(
         mlp_tc_block_k=mlp_core.mlp_tc_block_k,
         mlp_tc_warps=mlp_core.mlp_tc_warps,
         mlp_tc_stages=mlp_core.mlp_tc_stages,
+        mlp_tc_split_k=mlp_core.mlp_tc_split_k,
         ple_conditioned=ple.ple_conditioned,
         ple_block_size=ple.ple_block_size,
     )
@@ -1142,7 +1234,8 @@ def main(argv: list[str] | None = None) -> int:
     def tensorcore_key(case: ComputeCase) -> str:
         return (
             f"bn{case.mlp_tc_block_n}_bk{case.mlp_tc_block_k}_"
-            f"w{case.mlp_tc_warps}_s{case.mlp_tc_stages}"
+            f"w{case.mlp_tc_warps}_s{case.mlp_tc_stages}_"
+            f"sk{case.mlp_tc_split_k}"
         )
 
     tensorcore_cases = tuple(

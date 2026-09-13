@@ -79,6 +79,11 @@ def test_mlp_chain_frontier_covers_activation_tensorcore_and_ple_tiles():
         (64, 64),
     }
     assert {
+        case.mlp_tc_split_k
+        for case in tensorcore
+        if case.mlp_tc_split_k > 1
+    } == {2, 4, 8}
+    assert {
         by_name[f"ple_conditioned_bs{block}"].ple_block_size
         for block in (128, 256, 512, 1024)
     } == {128, 256, 512, 1024}
@@ -275,6 +280,7 @@ def test_combination_propagates_mlp_core_and_ple_winners():
         mlp_tc_block_k=32,
         mlp_tc_warps=8,
         mlp_tc_stages=3,
+        mlp_tc_split_k=4,
     )
     ple = gate.ComputeCase(
         "ple_win",
@@ -299,6 +305,7 @@ def test_combination_propagates_mlp_core_and_ple_winners():
         combined.mlp_tc_warps,
         combined.mlp_tc_stages,
     ) == (128, 32, 8, 3)
+    assert combined.mlp_tc_split_k == 4
     assert combined.ple_conditioned is True
     assert combined.ple_block_size == 512
 
@@ -571,3 +578,16 @@ def test_mlp_chain_wrapper_is_drive_native_and_full_model():
     assert "mlp_gated_act_bs512" in wrapper
     assert "mlp_tc_bn64_bk32_w4_s2" in wrapper
     assert "ple_conditioned_bs256" in wrapper
+
+
+def test_splitk_wrapper_is_drive_native_and_targets_long_generation():
+    wrapper = (
+        gate.ROOT / "benchmarks" /
+        "run_gemma4_e2b_b8_mlp_splitk_frontier_colab.sh"
+    ).read_text(encoding="utf-8")
+    assert "/content/drive/MyDrive/mg/MGRrmsnorm" in wrapper
+    assert "git pull" not in wrapper
+    assert "vllm" not in wrapper.lower()
+    assert 'SCREEN_OUTPUT_TOKENS="${SCREEN_OUTPUT_TOKENS:-128}"' in wrapper
+    for split_k in (2, 4, 8):
+        assert f"_sk{split_k}" in wrapper
