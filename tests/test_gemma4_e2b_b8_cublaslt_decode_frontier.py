@@ -116,6 +116,7 @@ def test_shape_collection_counts_attention_and_ple_but_not_mlp():
     assert (8, 1536, 24576) not in grouped
     assert (8, 12288, 1536) not in grouped
     assert grouped[(8, 2048, 1536)]["occurrences_per_token"] == 2
+    assert len(grouped[(8, 2048, 1536)]["weights"]) == 2
     assert grouped[(8, 1536, 256)]["operations"] == {"ple_gate": 2}
     assert grouped[(8, 256, 1536)]["operations"] == {"ple_proj": 2}
 

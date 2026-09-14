@@ -66,6 +66,7 @@ def cuda_samples_us(
     *,
     warmups: int,
     repeats: int,
+    operations_per_call: int = 1,
 ) -> list[float]:
     import torch
 
@@ -80,7 +81,9 @@ def cuda_samples_us(
         fn()
         end.record()
         end.synchronize()
-        samples.append(float(start.elapsed_time(end)) * 1000.0)
+        samples.append(
+            float(start.elapsed_time(end)) * 1000.0 / operations_per_call
+        )
     return samples
 
 
@@ -98,10 +101,12 @@ def collect_shapes(model: Any, rows: int) -> dict[Shape, dict[str, Any]]:
                 {
                     "shape": shape,
                     "wt": wt,
+                    "weights": [],
                     "occurrences_per_token": 0,
                     "operations": defaultdict(int),
                 },
             )
+            entry["weights"].append(wt)
             entry["occurrences_per_token"] += 1
             entry["operations"][operation] += 1
     return grouped
@@ -157,6 +162,13 @@ def tune_shapes(
         rows, inner, output = shape
         entry = grouped[shape]
         wt = entry["wt"]
+        weights = entry["weights"]
+        # A single ~30 us launch is too noisy on a shared Colab GPU.  Time a
+        # real-weight stream spanning every layer with this exact shape and
+        # repeat the stream until each CUDA-event sample contains >=32 GEMMs.
+        # Reported samples remain normalized to one GEMM.
+        stream_rounds = max(1, math.ceil(32 / len(weights)))
+        stream_operations = stream_rounds * len(weights)
         raw_weight = wt.t()
         if not raw_weight.is_contiguous():
             raise RuntimeError(f"{shape_name(shape)} raw weight is not contiguous")
@@ -173,11 +185,19 @@ def tune_shapes(
         def baseline() -> Any:
             return torch.mm(x, wt, out=baseline_out)
 
+        def baseline_stream() -> None:
+            for _ in range(stream_rounds):
+                for stream_wt in weights:
+                    torch.mm(x, stream_wt, out=baseline_out)
+
         with torch.inference_mode():
             baseline()
             reference = baseline_out.clone()
             baseline_before = cuda_samples_us(
-                baseline, warmups=warmups, repeats=repeats
+                baseline_stream,
+                warmups=warmups,
+                repeats=repeats,
+                operations_per_call=stream_operations,
             )
             algorithm_count = cublaslt_bf16_algorithm_count_cuda(
                 x, raw_weight, maximum_algorithms
@@ -193,6 +213,17 @@ def tune_shapes(
                         algorithm_index=index,
                     )
 
+                def candidate_stream(index: int = algorithm_index) -> None:
+                    for _ in range(stream_rounds):
+                        for stream_wt in weights:
+                            cublaslt_bf16_linear_cuda(
+                                x,
+                                stream_wt.t(),
+                                None,
+                                out=candidate_out,
+                                algorithm_index=index,
+                            )
+
                 try:
                     candidate()
                     first = candidate_out.clone()
@@ -200,7 +231,10 @@ def tune_shapes(
                     repeat_exact = bool(torch.equal(first, candidate_out))
                     metrics = numeric_metrics(reference, candidate_out)
                     samples = cuda_samples_us(
-                        candidate, warmups=warmups, repeats=repeats
+                        candidate_stream,
+                        warmups=warmups,
+                        repeats=repeats,
+                        operations_per_call=stream_operations,
                     )
                     error = None
                 except Exception as exc:
@@ -234,7 +268,10 @@ def tune_shapes(
                     }
                 )
             baseline_after = cuda_samples_us(
-                baseline, warmups=warmups, repeats=repeats
+                baseline_stream,
+                warmups=warmups,
+                repeats=repeats,
+                operations_per_call=stream_operations,
             )
 
         baseline_samples = baseline_before + baseline_after
@@ -266,6 +303,9 @@ def tune_shapes(
             "shape": list(shape),
             "operations": dict(entry["operations"]),
             "occurrences_per_token": occurrence_count,
+            "real_weight_stream_size": len(weights),
+            "stream_rounds": stream_rounds,
+            "operations_per_timing_sample": stream_operations,
             "torch_mm_samples_us": baseline_samples,
             "torch_mm_median_us": baseline_us,
             "algorithm_count": algorithm_count,
