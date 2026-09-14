@@ -11545,6 +11545,15 @@ class MegaGemmLlama(nn.Module):
         self._gemma4_flat_cublaslt_gateup_runtime_disabled = False
         self._gemma4_flat_cublaslt_gateup_failure = ""
         self._gemma4_flat_cublaslt_gateup_algorithms = {}
+        # Experimental per-shape cuBLASLt dispatch for the remaining Gemma 4
+        # flat-decode projections (attention and PLE).  RuntimePolicy keeps it
+        # disabled; the full-model L4 gate installs only algorithms that beat
+        # torch.mm for their exact M/K/N shape and then captures a fresh graph.
+        self._gemma4_flat_cublaslt_decode_enabled = False
+        self._gemma4_flat_cublaslt_decode_algorithms = {}
+        self._gemma4_flat_cublaslt_decode_hits = {}
+        self._gemma4_flat_cublaslt_decode_runtime_disabled = False
+        self._gemma4_flat_cublaslt_decode_failure = ""
         self._gemma4_flat_policy_fused_gateup_rows = ()
         self._gemma4_flat_policy_deepfusion_rows = ()
         self._gemma4_flat_policy_cublas_gateup_rows = ()
@@ -15270,6 +15279,31 @@ class MegaGemmLlama(nn.Module):
             "gemma4_cublaslt_gateup_failure": str(
                 getattr(self, "_gemma4_flat_cublaslt_gateup_failure", "")
             ),
+            "gemma4_cublaslt_decode_enabled": bool(
+                getattr(self, "_gemma4_flat_cublaslt_decode_enabled", False)
+            ),
+            "gemma4_cublaslt_decode_algorithms": {
+                f"m{int(key[0])}_k{int(key[1])}_n{int(key[2])}": int(value)
+                for key, value in getattr(
+                    self, "_gemma4_flat_cublaslt_decode_algorithms", {}
+                ).items()
+            },
+            "gemma4_cublaslt_decode_hits": {
+                f"m{int(key[0])}_k{int(key[1])}_n{int(key[2])}": int(value)
+                for key, value in getattr(
+                    self, "_gemma4_flat_cublaslt_decode_hits", {}
+                ).items()
+            },
+            "gemma4_cublaslt_decode_runtime_disabled": bool(
+                getattr(
+                    self,
+                    "_gemma4_flat_cublaslt_decode_runtime_disabled",
+                    False,
+                )
+            ),
+            "gemma4_cublaslt_decode_failure": str(
+                getattr(self, "_gemma4_flat_cublaslt_decode_failure", "")
+            ),
             "gemma4_dense_post_norm_chain_decode_enabled": bool(
                 getattr(
                     self,
@@ -16633,6 +16667,66 @@ class MegaGemmLlama(nn.Module):
             out.add_(bias)
         return out
 
+    def _gemma4_flat_fp_linear(
+        self,
+        x: torch.Tensor,
+        wt: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dispatch one exact flat-decode shape to a preselected cuBLASLt algo.
+
+        ``wt`` is the zero-copy [K, N] transpose used by torch.mm.  The native
+        entrypoint consumes the original contiguous [N, K] view.  No search,
+        allocation or plan construction belongs in the captured graph: the
+        benchmark primes each selected shape before enabling graph capture.
+        """
+        algorithms = getattr(
+            self, "_gemma4_flat_cublaslt_decode_algorithms", {}
+        )
+        key = (int(x.shape[0]), int(x.shape[1]), int(wt.shape[1]))
+        use_cublaslt = bool(
+            getattr(self, "_gemma4_flat_cublaslt_decode_enabled", False)
+            and not getattr(
+                self, "_gemma4_flat_cublaslt_decode_runtime_disabled", False
+            )
+            and callable(cublaslt_bf16_linear_cuda)
+            and key in algorithms
+            and x.is_cuda
+            and wt.is_cuda
+            and out.is_cuda
+            and x.dtype == torch.bfloat16
+            and wt.dtype == torch.bfloat16
+            and out.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and out.is_contiguous()
+            and not torch.is_grad_enabled()
+        )
+        if use_cublaslt:
+            raw_weight = wt.t()
+            if raw_weight.is_contiguous():
+                try:
+                    result = cublaslt_bf16_linear_cuda(
+                        x,
+                        raw_weight,
+                        bias,
+                        out=out,
+                        algorithm_index=int(algorithms[key]),
+                    )
+                except Exception as exc:
+                    self._gemma4_flat_cublaslt_decode_runtime_disabled = True
+                    if not getattr(
+                        self, "_gemma4_flat_cublaslt_decode_failure", ""
+                    ):
+                        self._gemma4_flat_cublaslt_decode_failure = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                else:
+                    hits = self._gemma4_flat_cublaslt_decode_hits
+                    hits[key] = int(hits.get(key, 0)) + 1
+                    return result
+        return self._flat_fp_linear(x, wt, bias, out)
+
     def _prepare_gemma4_flat_decode(self):
         """Collect Gemma 4 text weights for a single-loop decode path."""
         try:
@@ -17781,6 +17875,9 @@ class MegaGemmLlama(nn.Module):
             self._gemma4_flat_cublaslt_gateup_hits = 0
             self._gemma4_flat_cublaslt_gateup_runtime_disabled = False
             self._gemma4_flat_cublaslt_gateup_failure = ""
+            self._gemma4_flat_cublaslt_decode_hits = {}
+            self._gemma4_flat_cublaslt_decode_runtime_disabled = False
+            self._gemma4_flat_cublaslt_decode_failure = ""
             self._gemma4_flat_b8_gated_activation_hits = 0
             self._gemma4_flat_b8_gated_activation_runtime_disabled = False
             self._gemma4_flat_b8_gated_activation_failure = ""
@@ -18905,7 +19002,7 @@ class MegaGemmLlama(nn.Module):
 
             attn_qkv_start_end = _timing_record_start(timing_events is not None)
             if lw.qkv_wt is not None:
-                qkv = self._flat_fp_linear(
+                qkv = self._gemma4_flat_fp_linear(
                     normed,
                     lw.qkv_wt,
                     lw.qkv_bias,
@@ -18916,7 +19013,7 @@ class MegaGemmLlama(nn.Module):
                 v_raw = k_raw if lw.v_from_k else qkv[:, lw.q_size + lw.k_size:]
             else:
                 if lw.q_wt is not None:
-                    q_raw = self._flat_fp_linear(
+                    q_raw = self._gemma4_flat_fp_linear(
                         normed,
                         lw.q_wt,
                         lw.q_bias,
@@ -18939,7 +19036,7 @@ class MegaGemmLlama(nn.Module):
                 v_raw = None
                 if not lw.is_kv_shared:
                     if lw.k_wt is not None:
-                        k_raw = self._flat_fp_linear(
+                        k_raw = self._gemma4_flat_fp_linear(
                             normed,
                             lw.k_wt,
                             lw.k_bias,
@@ -18961,7 +19058,7 @@ class MegaGemmLlama(nn.Module):
                     if lw.v_from_k:
                         v_raw = k_raw
                     elif lw.v_wt is not None:
-                        v_raw = self._flat_fp_linear(
+                        v_raw = self._gemma4_flat_fp_linear(
                             normed,
                             lw.v_wt,
                             lw.v_bias,
@@ -19110,7 +19207,7 @@ class MegaGemmLlama(nn.Module):
             attn_2d = attn.reshape(bsz, lw.num_q_heads * lw.head_dim)
             attn_o_proj_start_end = _timing_record_start(timing_events is not None)
             if lw.o_wt is not None:
-                o_out = self._flat_fp_linear(
+                o_out = self._gemma4_flat_fp_linear(
                     attn_2d,
                     lw.o_wt,
                     lw.o_bias,
@@ -19538,7 +19635,7 @@ class MegaGemmLlama(nn.Module):
             if has_ple_tail:
                 residual = hidden
                 ple_start_end = _timing_record_start(timing_events is not None)
-                ple = self._flat_fp_linear(
+                ple = self._gemma4_flat_fp_linear(
                     hidden,
                     lw.ple_gate_wt,
                     None,
@@ -19581,7 +19678,7 @@ class MegaGemmLlama(nn.Module):
                 if not use_conditioned_gelu:
                     ple = torch.nn.functional.gelu(ple, approximate='tanh')
                     ple.mul_(ple_condition)
-                ple_proj = self._flat_fp_linear(
+                ple_proj = self._gemma4_flat_fp_linear(
                     ple,
                     lw.ple_proj_wt,
                     None,
