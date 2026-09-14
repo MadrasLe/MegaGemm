@@ -605,7 +605,12 @@ def main(argv: list[str] | None = None) -> int:
         }
 
     payload = {
-        "status": "passed" if decision["valid"] else "failed",
+        "status": (
+            "passed"
+            if not setup["production"]["errors"]
+            and not summary["production"]["errors"]
+            else "failed"
+        ),
         "method": {
             "gpu": torch.cuda.get_device_name(),
             "torch": torch.__version__,
@@ -631,7 +636,14 @@ def main(argv: list[str] | None = None) -> int:
     print("SUMMARY " + json.dumps(summary, sort_keys=True), flush=True)
     print("DECISION " + json.dumps(decision, sort_keys=True), flush=True)
     print(f"Wrote: {args.output}", flush=True)
-    return 0 if decision["valid"] else 2
+    # A numerically or operationally rejected experiment is a successful gate
+    # outcome, not a harness failure.  Reserve non-zero status for a broken
+    # production control or incomplete measurement.
+    gate_completed = bool(
+        not setup["production"]["errors"]
+        and not summary["production"]["errors"]
+    )
+    return 0 if gate_completed else 2
 
 
 if __name__ == "__main__":

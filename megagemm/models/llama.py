@@ -600,6 +600,10 @@ _GEMMA4_BATCH_CUBLAS_LM_HEAD = _env_enabled(
     # scheduler decode throughput with graph-token burst replay.
     default=True,
 )
+_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD_EXPERIMENT = _env_enabled(
+    "MEGAGEMM_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD_EXPERIMENT",
+    default=False,
+)
 _GEMMA4_BATCH_FUSED_SOFTCAP_ARGMAX = (
     HAS_FUSED_SOFTCAP_ARGMAX
     and logits_softcap_argmax is not None
@@ -1096,11 +1100,21 @@ def _gemma4_a100_a4b_batch_cublas_lm_head_shape(
     return bool(
         _GEMMA4_BATCH_CUBLAS_LM_HEAD
         and str(model_type) == "gemma4_text"
-        and int(rows) == 16
-        and int(hidden_dim) == 2816
         and int(vocab_size) == 262144
         and dtype == torch.bfloat16
-        and "A100" in str(device_name).upper()
+        and (
+            (
+                int(rows) == 16
+                and int(hidden_dim) == 2816
+                and "A100" in str(device_name).upper()
+            )
+            or (
+                _GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD_EXPERIMENT
+                and int(rows) == 8
+                and int(hidden_dim) == 1536
+                and "L4" in str(device_name).upper()
+            )
+        )
     )
 
 
@@ -15542,6 +15556,9 @@ class MegaGemmLlama(nn.Module):
             ),
             "gemma4_batch_cublas_lm_head_enabled": bool(
                 _GEMMA4_BATCH_CUBLAS_LM_HEAD
+            ),
+            "gemma4_e2b_l4_b8_batch_cublas_lm_head_experiment": bool(
+                _GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD_EXPERIMENT
             ),
             "gemma4_batch_cublas_lm_head_hits": int(
                 getattr(self, "_gemma4_batch_cublas_lm_head_hits", 0)
