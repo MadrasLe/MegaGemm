@@ -68,6 +68,10 @@ def test_fast_profile_is_scoped_and_model_specific(monkeypatch):
     assert "MEGAGEMM_GEMMA4_FORCE_FUSED_GATEUP_USE" not in e4b_env
     assert "MEGAGEMM_GEMMA4_FORCE_DEEPFUSION_USE" not in e4b_env
     assert e2b_env["MEGAGEMM_DISABLE_CUDA_RMSNORM"] == "1"
+    assert (
+        e2b_env["MEGAGEMM_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD"]
+        == "1"
+    )
     assert "MEGAGEMM_DECODE_PREFER_STEP" not in e2b_env
     assert "MEGAGEMM_DECODE_CUDA_GRAPHS" not in e2b_env
     assert "MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP" not in e2b_env
@@ -413,6 +417,12 @@ def test_e2b_audit_proves_batch8_cublas_mlp_policy_and_zero_fusion_hits(tmp_path
             "gemma4_policy_bf16_cublas_down_rows": [8],
             "gemma4_flat_fused_gateup_hits": 0,
             "gemma4_flat_deepfusion_hits": 0,
+            "gemma4_batch_cublas_lm_head_enabled": True,
+            "gemma4_e2b_l4_b8_batch_cublas_lm_head_enabled": True,
+            "gemma4_batch_cublas_lm_head_hits": 127,
+            "gemma4_batch_fused_softcap_argmax_hits": 127,
+            "gemma4_batch_fused_softcap_argmax_disabled": False,
+            "gemma4_batch_fused_softcap_argmax_error": "",
             "runtime_policy": {
                 "gemma4_e2b_h512_dense_bridge_pair": True,
             },
@@ -463,6 +473,14 @@ def test_e2b_audit_proves_batch8_cublas_mlp_policy_and_zero_fusion_hits(tmp_path
     assert report["required"]["batch8_cublas_down_policy_rows"] == [[8]]
     assert report["required"]["batch8_fused_gateup_hits"] == 0
     assert report["required"]["batch8_deepfusion_hits"] == 0
+    assert report["required"][
+        "e2b_l4_b8_tensorcore_softcap_lm_head_enabled"
+    ] is True
+    assert report["required"]["e2b_l4_b8_tensorcore_lm_head_hits"] == 127
+    assert report["required"]["e2b_l4_b8_softcap_argmax_hits"] == 127
+    assert report["selected_lm_head"][
+        "gemma4_e2b_l4_b8_tensorcore_softcap"
+    ] is True
     assert report["required"]["e2b_h512_dense_bridge_pair_policy_enabled"] is True
     assert report["required"]["e2b_h512_grouped_attention_segments"] == [32]
     assert report["required"]["e2b_h512_grouped_attention_tiles"] == [16]
@@ -513,6 +531,12 @@ def test_e2b_audit_requires_promoted_l4_long_sliding_prefill_hits(tmp_path):
             "gemma4_policy_bf16_cublas_down_rows": [8],
             "gemma4_flat_fused_gateup_hits": 0,
             "gemma4_flat_deepfusion_hits": 0,
+            "gemma4_batch_cublas_lm_head_enabled": True,
+            "gemma4_e2b_l4_b8_batch_cublas_lm_head_enabled": True,
+            "gemma4_batch_cublas_lm_head_hits": 127,
+            "gemma4_batch_fused_softcap_argmax_hits": 127,
+            "gemma4_batch_fused_softcap_argmax_disabled": False,
+            "gemma4_batch_fused_softcap_argmax_error": "",
             "gemma4_e2b_l4_sliding_prefill_enabled": True,
             "gemma4_e2b_l4_sliding_prefill_hits": 224,
             "gemma4_e2b_l4_full_prefill_expand_enabled": True,

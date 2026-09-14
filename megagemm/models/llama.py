@@ -600,9 +600,14 @@ _GEMMA4_BATCH_CUBLAS_LM_HEAD = _env_enabled(
     # scheduler decode throughput with graph-token burst replay.
     default=True,
 )
-_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD_EXPERIMENT = _env_enabled(
-    "MEGAGEMM_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD_EXPERIMENT",
-    default=False,
+_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD = _env_enabled(
+    "MEGAGEMM_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD",
+    # Promoted on L4/BF16/B8 after a one-load full-model gate measured
+    # +4.98% paired incremental decode and +3.33% wall throughput.  An
+    # actual-hidden oracle then matched TensorCore+softcap on 64/64 rows;
+    # the former direct fused reduction matched only 61/64 because Gemma's
+    # BF16 softcap collapsed different raw logits to equal capped values.
+    default=True,
 )
 _GEMMA4_BATCH_FUSED_SOFTCAP_ARGMAX = (
     HAS_FUSED_SOFTCAP_ARGMAX
@@ -1109,7 +1114,7 @@ def _gemma4_a100_a4b_batch_cublas_lm_head_shape(
                 and "A100" in str(device_name).upper()
             )
             or (
-                _GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD_EXPERIMENT
+                _GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD
                 and int(rows) == 8
                 and int(hidden_dim) == 1536
                 and "L4" in str(device_name).upper()
@@ -12313,20 +12318,31 @@ class MegaGemmLlama(nn.Module):
         """
         vocab_size = int(self.config.vocab_size)
         rows = int(hidden.shape[0] * hidden.shape[1]) if hidden.dim() == 3 else int(hidden.shape[0])
-        if hidden.is_cuda and _gemma4_a100_a4b_batch_cublas_lm_head_shape(
-            self.config.model_type,
-            rows,
-            int(hidden.shape[-1]),
-            vocab_size,
-            hidden.dtype,
-            torch.cuda.get_device_name(hidden.device),
-        ):
+        batch_cublas_lm_head = bool(
+            hidden.is_cuda
+            and _gemma4_a100_a4b_batch_cublas_lm_head_shape(
+                self.config.model_type,
+                rows,
+                int(hidden.shape[-1]),
+                vocab_size,
+                hidden.dtype,
+                torch.cuda.get_device_name(hidden.device),
+            )
+        )
+        promoted_e2b_l4_b8 = bool(
+            batch_cublas_lm_head
+            and _GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD
+            and rows == 8
+            and int(hidden.shape[-1]) == 1536
+            and "L4" in torch.cuda.get_device_name(hidden.device).upper()
+        )
+        if batch_cublas_lm_head:
             self._gemma4_batch_cublas_lm_head_hits += 1
             # Gemma4's BF16 softcap can collapse distinct logits to the same
             # value. Apply it before argmax so ties match the logits contract.
             raw_logits = self._decode_raw_logits_from_hidden(hidden)
             if (
-                _GEMMA4_BATCH_FUSED_SOFTCAP_ARGMAX
+                (_GEMMA4_BATCH_FUSED_SOFTCAP_ARGMAX or promoted_e2b_l4_b8)
                 and logits_softcap_argmax is not None
                 and not self._gemma4_batch_fused_softcap_argmax_disable
                 and self.final_logit_softcapping > 0
@@ -15557,8 +15573,8 @@ class MegaGemmLlama(nn.Module):
             "gemma4_batch_cublas_lm_head_enabled": bool(
                 _GEMMA4_BATCH_CUBLAS_LM_HEAD
             ),
-            "gemma4_e2b_l4_b8_batch_cublas_lm_head_experiment": bool(
-                _GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD_EXPERIMENT
+            "gemma4_e2b_l4_b8_batch_cublas_lm_head_enabled": bool(
+                _GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD
             ),
             "gemma4_batch_cublas_lm_head_hits": int(
                 getattr(self, "_gemma4_batch_cublas_lm_head_hits", 0)

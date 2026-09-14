@@ -76,6 +76,7 @@ GEMMA4_DENSE_COMMON_PROFILE = {
 GEMMA4_E2B_FAST_PROFILE = {
     **GEMMA4_DENSE_COMMON_PROFILE,
     "MEGAGEMM_DISABLE_CUDA_RMSNORM": "1",
+    "MEGAGEMM_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD": "1",
 }
 
 
@@ -108,6 +109,7 @@ GEMMA4_PROFILE_REQUIREMENTS = {
         "require_dense_post_norm_chain": True,
         "require_e2b_h512_dense_bridge_pair": True,
         "require_bf16_batch8_cublas_mlp": True,
+        "require_e2b_l4_b8_tensorcore_softcap_lm_head": True,
         "require_e2b_l4_sliding_prefill": True,
         "require_e2b_l4_full_prefill_expand": True,
         "topology": {
@@ -669,6 +671,63 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
         for stats in batch8_decode_stats
         if isinstance(stats.get("paged_decode_runtime"), dict)
     ]
+    require_e2b_l4_b8_tensorcore_softcap_lm_head = bool(
+        requirement.get(
+            "require_e2b_l4_b8_tensorcore_softcap_lm_head",
+            False,
+        )
+    )
+    e2b_l4_b8_tensorcore_softcap_lm_head_applicable = bool(
+        require_e2b_l4_b8_tensorcore_softcap_lm_head and batch8_rows
+    )
+    e2b_l4_b8_tensorcore_softcap_lm_head_enabled = bool(
+        batch8_decode_stats
+        and all(
+            stats.get("gemma4_batch_cublas_lm_head_enabled")
+            and stats.get("gemma4_e2b_l4_b8_batch_cublas_lm_head_enabled")
+            for stats in batch8_decode_stats
+        )
+    )
+    e2b_l4_b8_tensorcore_lm_head_hits = _max_counter(
+        batch8_decode_stats,
+        "gemma4_batch_cublas_lm_head_hits",
+    )
+    e2b_l4_b8_softcap_argmax_hits = _max_counter(
+        batch8_decode_stats,
+        "gemma4_batch_fused_softcap_argmax_hits",
+    )
+    e2b_l4_b8_softcap_argmax_disabled = any(
+        stats.get("gemma4_batch_fused_softcap_argmax_disabled")
+        for stats in batch8_decode_stats
+    )
+    e2b_l4_b8_softcap_argmax_errors = sorted(
+        {
+            str(stats.get("gemma4_batch_fused_softcap_argmax_error"))
+            for stats in batch8_decode_stats
+            if stats.get("gemma4_batch_fused_softcap_argmax_error")
+        }
+    )
+    if e2b_l4_b8_tensorcore_softcap_lm_head_applicable:
+        if not e2b_l4_b8_tensorcore_softcap_lm_head_enabled:
+            errors.append(
+                "E2B L4 B8 promoted Tensor Core LM-head route was not enabled"
+            )
+        if e2b_l4_b8_tensorcore_lm_head_hits <= 0:
+            errors.append(
+                "E2B L4 B8 promoted Tensor Core LM-head route was not exercised"
+            )
+        if e2b_l4_b8_softcap_argmax_hits <= 0:
+            errors.append(
+                "E2B L4 B8 promoted fused softcap+argmax was not exercised"
+            )
+        if (
+            e2b_l4_b8_softcap_argmax_disabled
+            or e2b_l4_b8_softcap_argmax_errors
+        ):
+            errors.append(
+                "E2B L4 B8 fused softcap+argmax disabled itself: "
+                + "; ".join(e2b_l4_b8_softcap_argmax_errors or ["unspecified"])
+            )
     require_e2b_h512_dense_bridge_pair = bool(
         requirement.get("require_e2b_h512_dense_bridge_pair", False)
     )
@@ -1042,6 +1101,24 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
             ],
             "batch8_fused_gateup_hits": batch8_fused_gateup_hits,
             "batch8_deepfusion_hits": batch8_deepfusion_hits,
+            "e2b_l4_b8_tensorcore_softcap_lm_head_required": (
+                require_e2b_l4_b8_tensorcore_softcap_lm_head
+            ),
+            "e2b_l4_b8_tensorcore_softcap_lm_head_applicable": (
+                e2b_l4_b8_tensorcore_softcap_lm_head_applicable
+            ),
+            "e2b_l4_b8_tensorcore_softcap_lm_head_enabled": (
+                e2b_l4_b8_tensorcore_softcap_lm_head_enabled
+            ),
+            "e2b_l4_b8_tensorcore_lm_head_hits": (
+                e2b_l4_b8_tensorcore_lm_head_hits
+            ),
+            "e2b_l4_b8_softcap_argmax_hits": (
+                e2b_l4_b8_softcap_argmax_hits
+            ),
+            "e2b_l4_b8_softcap_argmax_errors": (
+                e2b_l4_b8_softcap_argmax_errors
+            ),
             "e2b_h512_dense_bridge_pair_required": (
                 require_e2b_h512_dense_bridge_pair
             ),
@@ -1118,6 +1195,12 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
             ),
             "gemma4_dense_attn_mlp_bridge": dense_bridge_hits,
             "gemma4_e2b_h512_grouped_attention": h512_grouped_hits,
+            "gemma4_e2b_l4_b8_tensorcore_lm_head": (
+                e2b_l4_b8_tensorcore_lm_head_hits
+            ),
+            "gemma4_e2b_l4_b8_fused_softcap_argmax": (
+                e2b_l4_b8_softcap_argmax_hits
+            ),
             "gemma4_fused_dual_ffn_norm_prefill": _max_counter(
                 decode_stats, "gemma4_fused_dual_ffn_norm_prefill_hits"
             ),
@@ -1135,6 +1218,12 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
             ),
         },
         "selected_lm_head": {
+            "gemma4_e2b_l4_b8_tensorcore_softcap": bool(
+                e2b_l4_b8_tensorcore_softcap_lm_head_enabled
+                and e2b_l4_b8_tensorcore_lm_head_hits > 0
+                and e2b_l4_b8_softcap_argmax_hits > 0
+                and not e2b_l4_b8_softcap_argmax_disabled
+            ),
             "fused_rmsnorm_lm_head_argmax": any(
                 bool(item.get("fused_rmsnorm_lm_head_argmax_use"))
                 for item in decode_stats

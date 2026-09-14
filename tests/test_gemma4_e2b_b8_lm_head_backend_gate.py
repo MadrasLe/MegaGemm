@@ -8,9 +8,9 @@ from megagemm.models import llama
 
 def test_cases_cover_current_and_both_tensorcore_reductions():
     assert [case.name for case in gate.CASES] == [
-        "production_fused",
+        "legacy_direct_fused",
         "tensorcore_full_logits",
-        "tensorcore_fused_softcap_argmax",
+        "production_tensorcore_fused_softcap",
     ]
     assert not gate.CASES[0].batch_cublas
     assert gate.CASES[1].batch_cublas
@@ -19,19 +19,26 @@ def test_cases_cover_current_and_both_tensorcore_reductions():
     assert gate.CASES[2].fused_softcap_argmax
 
 
-def test_e2b_l4_b8_batch_cublas_shape_is_experimental_and_exact(monkeypatch):
+def test_promoted_e2b_route_forces_correct_softcap_reduction():
+    source = Path(llama.__file__).read_text(encoding="utf-8")
+    assert '"MEGAGEMM_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD"' in source
+    assert "default=True" in source
+    assert "(_GEMMA4_BATCH_FUSED_SOFTCAP_ARGMAX or promoted_e2b_l4_b8)" in source
+
+
+def test_e2b_l4_b8_batch_cublas_shape_is_promoted_and_exact(monkeypatch):
     check = llama._gemma4_a100_a4b_batch_cublas_lm_head_shape
     monkeypatch.setattr(llama, "_GEMMA4_BATCH_CUBLAS_LM_HEAD", True)
     monkeypatch.setattr(
         llama,
-        "_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD_EXPERIMENT",
+        "_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD",
         False,
     )
     args = ("gemma4_text", 8, 1536, 262144, torch.bfloat16, "NVIDIA L4")
     assert not check(*args)
     monkeypatch.setattr(
         llama,
-        "_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD_EXPERIMENT",
+        "_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD",
         True,
     )
     assert check(*args)
@@ -46,7 +53,7 @@ def test_existing_a4b_shape_remains_available_without_e2b_experiment(monkeypatch
     monkeypatch.setattr(llama, "_GEMMA4_BATCH_CUBLAS_LM_HEAD", True)
     monkeypatch.setattr(
         llama,
-        "_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD_EXPERIMENT",
+        "_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD",
         False,
     )
     assert llama._gemma4_a100_a4b_batch_cublas_lm_head_shape(
@@ -62,7 +69,7 @@ def test_route_audit_distinguishes_three_backends():
     assert gate.route_errors(gate.CASES[0], production) == []
     full_logits = {
         "gemma4_batch_cublas_lm_head_hits": 1,
-        "gemma4_e2b_l4_b8_batch_cublas_lm_head_experiment": True,
+        "gemma4_e2b_l4_b8_batch_cublas_lm_head_enabled": True,
         "gemma4_batch_fused_softcap_argmax_hits": 0,
     }
     assert gate.route_errors(gate.CASES[1], full_logits) == []

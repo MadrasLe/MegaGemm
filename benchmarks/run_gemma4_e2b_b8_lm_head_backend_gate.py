@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""One-load full-model LM-head backend gate for Gemma 4 E2B/L4/B8.
+"""One-load full-model LM-head promotion gate for Gemma 4 E2B/L4/B8.
 
-Compares the promoted fused RMSNorm+argmax path against Tensor Core full-logit
-GEMM with either the exact PyTorch softcap/argmax contract or the existing
-fused softcap reduction.  Every route owns a separate CUDA Graph and is judged
-on paired P2048/O1-O128 natural-greedy full-model measurements.
+Compares the legacy direct RMSNorm+argmax path, the canonical Tensor Core
+full-logit contract, and the promoted Tensor Core+fused-softcap production
+path. Every route owns a separate CUDA Graph and is judged on paired
+P2048/O1-O128 natural-greedy full-model measurements.
 """
 
 from __future__ import annotations
@@ -43,10 +43,10 @@ class Case:
 
 
 CASES = (
-    Case("production_fused"),
+    Case("legacy_direct_fused"),
     Case("tensorcore_full_logits", batch_cublas=True),
     Case(
-        "tensorcore_fused_softcap_argmax",
+        "production_tensorcore_fused_softcap",
         batch_cublas=True,
         fused_softcap_argmax=True,
     ),
@@ -63,9 +63,9 @@ def spread(values: list[float]) -> float:
 
 def apply_case(llama_module: Any, case: Case) -> None:
     # The generic batch-cuBLAS switch remains required by the established A4B
-    # path; this exact E2B/L4/B8 switch is experimental and disabled by default.
+    # path. Toggle the exact promoted E2B/L4/B8 route for paired regression.
     llama_module._GEMMA4_BATCH_CUBLAS_LM_HEAD = True
-    llama_module._GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD_EXPERIMENT = bool(
+    llama_module._GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD = bool(
         case.batch_cublas
     )
     llama_module._GEMMA4_BATCH_FUSED_SOFTCAP_ARGMAX = bool(
@@ -77,6 +77,8 @@ def validate_row(
     row: dict[str, Any],
     reference: dict[str, Any],
     output_tokens: int,
+    *,
+    require_reference_match: bool = True,
 ) -> list[str]:
     errors: list[str] = []
     expected = 8 * output_tokens
@@ -87,9 +89,9 @@ def validate_row(
     if row.get("engine_prompt_lengths") != reference.get("engine_prompt_lengths"):
         errors.append("effective prompts differ from production")
     comparison = compare_generated_tokens(row, reference)
-    if not comparison["exact_match"]:
+    if require_reference_match and not comparison["exact_match"]:
         errors.append(
-            "natural greedy tokens differ from production: "
+            "natural greedy tokens differ from canonical full logits: "
             f"agreement={comparison['token_agreement']:.6f} "
             f"first={comparison['first_divergence']}"
         )
@@ -113,9 +115,9 @@ def route_errors(case: Case, runtime: dict[str, Any]) -> list[str]:
         if cublas_hits <= 0:
             errors.append("Tensor Core full-logit route recorded no capture hits")
         if not runtime.get(
-            "gemma4_e2b_l4_b8_batch_cublas_lm_head_experiment", False
+            "gemma4_e2b_l4_b8_batch_cublas_lm_head_enabled", False
         ):
-            errors.append("E2B/L4/B8 batch-cuBLAS experiment is disabled")
+            errors.append("E2B/L4/B8 Tensor Core LM-head route is disabled")
         if case.fused_softcap_argmax:
             if softcap_hits <= 0:
                 errors.append("fused softcap+argmax recorded no capture hits")
@@ -192,10 +194,10 @@ def main(argv: list[str] | None = None) -> int:
     print("  cases: " + ", ".join(case.name for case in CASES), flush=True)
     print("  model loads: 1; competing-engine install: disabled", flush=True)
 
-    production_case = CASES[0]
-    production_short = run_case(production_case, 1)
-    production_long = run_case(production_case, args.max_new_tokens)
-    effective = effective_max_prompt_tokens(production_long, 8)
+    legacy_case, oracle_case, production_case = CASES
+    oracle_short = run_case(oracle_case, 1)
+    oracle_long = run_case(oracle_case, args.max_new_tokens)
+    effective = effective_max_prompt_tokens(oracle_long, 8)
     if effective + args.max_new_tokens > args.max_seq_len:
         raise RuntimeError(
             "effective prompt plus output exceeds max sequence length: "
@@ -220,16 +222,29 @@ def main(argv: list[str] | None = None) -> int:
             long = run_case(case, args.max_new_tokens)
         assert short is not None and long is not None
         runtime = model.decode_runtime_stats()
-        errors = validate_row(short, production_short, 1)
-        errors.extend(validate_row(long, production_long, args.max_new_tokens))
+        require_canonical = case is not legacy_case
+        errors = validate_row(
+            short,
+            oracle_short,
+            1,
+            require_reference_match=require_canonical,
+        )
+        errors.extend(
+            validate_row(
+                long,
+                oracle_long,
+                args.max_new_tokens,
+                require_reference_match=require_canonical,
+            )
+        )
         errors.extend(route_errors(case, runtime))
         repeat_comparison = compare_generated_tokens(long, long_cold)
         if not repeat_comparison["exact_match"]:
             errors.append("route is not repeat-deterministic")
         setup[case.name] = {
             "errors": errors,
-            "production_comparison": compare_generated_tokens(
-                long, production_long
+            "canonical_comparison": compare_generated_tokens(
+                long, oracle_long
             ),
             "repeat_comparison": repeat_comparison,
             "runtime": runtime,
@@ -255,8 +270,21 @@ def main(argv: list[str] | None = None) -> int:
         for case in order:
             short = run_case(case, 1)
             long = run_case(case, args.max_new_tokens)
-            errors = validate_row(short, production_short, 1)
-            errors.extend(validate_row(long, production_long, args.max_new_tokens))
+            require_canonical = case is not legacy_case
+            errors = validate_row(
+                short,
+                oracle_short,
+                1,
+                require_reference_match=require_canonical,
+            )
+            errors.extend(
+                validate_row(
+                    long,
+                    oracle_long,
+                    args.max_new_tokens,
+                    require_reference_match=require_canonical,
+                )
+            )
             decode_s = float(long["elapsed_s"]) - float(short["elapsed_s"])
             decode_tokens = 8 * (args.max_new_tokens - 1)
             sample = {
@@ -295,35 +323,20 @@ def main(argv: list[str] | None = None) -> int:
             "errors": [error for row in rows for error in row["errors"]],
         }
 
+    legacy = summary[legacy_case.name]
+    oracle = summary[oracle_case.name]
     production = summary[production_case.name]
-    rankings: list[dict[str, Any]] = []
-    for case in CASES[1:]:
-        result = summary[case.name]
-        valid = bool(
-            not setup[case.name]["errors"]
-            and not result["errors"]
-            and result["decode_spread"] <= args.maximum_spread
-            and result["output_spread"] <= args.maximum_spread
-        )
-        rankings.append(
-            {
-                "case": case.name,
-                "valid": valid,
-                "decode_speedup": (
-                    result["median_incremental_decode_tps"]
-                    / production["median_incremental_decode_tps"]
-                ),
-                "output_speedup": (
-                    result["median_output_tps"]
-                    / production["median_output_tps"]
-                ),
-            }
-        )
-    winner = max(rankings, key=lambda item: item["decode_speedup"])
-    promote = bool(
-        winner["valid"]
-        and winner["decode_speedup"] >= args.minimum_decode_speedup
-        and winner["output_speedup"] >= args.minimum_output_speedup
+    legacy_healthy = bool(
+        not setup[legacy_case.name]["errors"]
+        and not legacy["errors"]
+        and legacy["decode_spread"] <= args.maximum_spread
+        and legacy["output_spread"] <= args.maximum_spread
+    )
+    oracle_healthy = bool(
+        not setup[oracle_case.name]["errors"]
+        and not oracle["errors"]
+        and oracle["decode_spread"] <= args.maximum_spread
+        and oracle["output_spread"] <= args.maximum_spread
     )
     production_healthy = bool(
         not setup[production_case.name]["errors"]
@@ -331,19 +344,43 @@ def main(argv: list[str] | None = None) -> int:
         and production["decode_spread"] <= args.maximum_spread
         and production["output_spread"] <= args.maximum_spread
     )
+    production_matches_canonical = bool(
+        setup[production_case.name]["canonical_comparison"]["exact_match"]
+    )
+    decode_speedup = (
+        production["median_incremental_decode_tps"]
+        / legacy["median_incremental_decode_tps"]
+    )
+    output_speedup = (
+        production["median_output_tps"] / legacy["median_output_tps"]
+    )
+    confirmed = bool(
+        legacy_healthy
+        and oracle_healthy
+        and production_healthy
+        and production_matches_canonical
+        and decode_speedup >= args.minimum_decode_speedup
+        and output_speedup >= args.minimum_output_speedup
+    )
     decision = {
         "decision": (
-            f"PROMOTE_{winner['case'].upper()}" if promote else "KEEP_PRODUCTION"
+            "CONFIRM_PROMOTED_TENSORCORE_FUSED_SOFTCAP"
+            if confirmed
+            else "REVIEW_PROMOTION"
         ),
-        "promote": promote,
-        "winner": winner,
-        "rankings": rankings,
+        "confirmed": confirmed,
+        "production_matches_canonical": production_matches_canonical,
+        "decode_speedup_vs_legacy": decode_speedup,
+        "output_speedup_vs_legacy": output_speedup,
+        "legacy_healthy": legacy_healthy,
+        "canonical_full_logits_healthy": oracle_healthy,
         "minimum_decode_speedup": args.minimum_decode_speedup,
         "minimum_output_speedup": args.minimum_output_speedup,
         "production_healthy": production_healthy,
     }
+    completed = legacy_healthy and oracle_healthy and production_healthy
     payload = {
-        "status": "passed" if production_healthy else "failed",
+        "status": "passed" if completed else "failed",
         "method": {
             "gpu": torch.cuda.get_device_name(),
             "torch": torch.__version__,
@@ -355,6 +392,8 @@ def main(argv: list[str] | None = None) -> int:
             "max_new_tokens": args.max_new_tokens,
             "natural_greedy_tokens": True,
             "execution": "separate E2B/L4 B8 CUDA Graph burst16 per route",
+            "canonical_reference": oracle_case.name,
+            "production_route": production_case.name,
         },
         "setup": setup,
         "samples": samples,
@@ -366,9 +405,9 @@ def main(argv: list[str] | None = None) -> int:
     print("SUMMARY " + json.dumps(summary, sort_keys=True), flush=True)
     print("DECISION " + json.dumps(decision, sort_keys=True), flush=True)
     print(f"Wrote: {args.output}", flush=True)
-    # Candidate rejection is a successful gate outcome.  Fail only if the
-    # production control itself is invalid or unstable.
-    return 0 if production_healthy else 2
+    # A measured non-promotion is still a successful process outcome. Fail
+    # only when one of the three controls is structurally invalid or unstable.
+    return 0 if completed else 2
 
 
 if __name__ == "__main__":

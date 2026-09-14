@@ -38,6 +38,8 @@ AUDIT_FRAGMENTS = (
     "gemma4_cublaslt",
     "fused_lm_head",
     "fused_rmsnorm_lm_head",
+    "gemma4_batch_cublas_lm_head",
+    "gemma4_batch_fused_softcap",
 )
 
 
