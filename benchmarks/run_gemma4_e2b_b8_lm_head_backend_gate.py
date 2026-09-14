@@ -68,6 +68,9 @@ def apply_case(llama_module: Any, case: Case) -> None:
     llama_module._GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD = bool(
         case.batch_cublas
     )
+    llama_module._GEMMA4_E2B_L4_B8_FUSED_SOFTCAP_ARGMAX = bool(
+        case.fused_softcap_argmax
+    )
     llama_module._GEMMA4_BATCH_FUSED_SOFTCAP_ARGMAX = bool(
         case.fused_softcap_argmax
     )
@@ -119,6 +122,10 @@ def route_errors(case: Case, runtime: dict[str, Any]) -> list[str]:
         ):
             errors.append("E2B/L4/B8 Tensor Core LM-head route is disabled")
         if case.fused_softcap_argmax:
+            if not runtime.get(
+                "gemma4_e2b_l4_b8_fused_softcap_argmax_enabled", False
+            ):
+                errors.append("promoted E2B/L4/B8 fused softcap is disabled")
             if softcap_hits <= 0:
                 errors.append("fused softcap+argmax recorded no capture hits")
             if runtime.get("gemma4_batch_fused_softcap_argmax_disabled"):

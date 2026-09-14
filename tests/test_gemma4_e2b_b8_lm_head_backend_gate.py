@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -23,7 +24,14 @@ def test_promoted_e2b_route_forces_correct_softcap_reduction():
     source = Path(llama.__file__).read_text(encoding="utf-8")
     assert '"MEGAGEMM_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD"' in source
     assert "default=True" in source
-    assert "(_GEMMA4_BATCH_FUSED_SOFTCAP_ARGMAX or promoted_e2b_l4_b8)" in source
+    assert "and _GEMMA4_E2B_L4_B8_FUSED_SOFTCAP_ARGMAX" in source
+
+
+def test_backend_gate_can_disable_softcap_without_disabling_tensorcore():
+    module = SimpleNamespace()
+    gate.apply_case(module, gate.CASES[1])
+    assert module._GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD is True
+    assert module._GEMMA4_E2B_L4_B8_FUSED_SOFTCAP_ARGMAX is False
 
 
 def test_e2b_l4_b8_batch_cublas_shape_is_promoted_and_exact(monkeypatch):
@@ -74,6 +82,7 @@ def test_route_audit_distinguishes_three_backends():
     }
     assert gate.route_errors(gate.CASES[1], full_logits) == []
     fused_softcap = dict(full_logits)
+    fused_softcap["gemma4_e2b_l4_b8_fused_softcap_argmax_enabled"] = True
     fused_softcap["gemma4_batch_fused_softcap_argmax_hits"] = 1
     assert gate.route_errors(gate.CASES[2], fused_softcap) == []
     fused_softcap["gemma4_batch_cublas_lm_head_hits"] = 0

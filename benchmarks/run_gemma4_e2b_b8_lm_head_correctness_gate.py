@@ -247,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
             "MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP": "0",
             "MEGAGEMM_REUSE_REQUEST_SCHEDULER": "0",
             "MEGAGEMM_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD": "0",
+            "MEGAGEMM_GEMMA4_E2B_L4_B8_FUSED_SOFTCAP_ARGMAX": "0",
         }
     )
 
@@ -257,6 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     from megagemm.engine import InferenceEngine
 
     llama_module._GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD = False
+    llama_module._GEMMA4_E2B_L4_B8_FUSED_SOFTCAP_ARGMAX = False
     llama_module._GEMMA4_BATCH_FUSED_SOFTCAP_ARGMAX = False
     engine = InferenceEngine(
         args.model,

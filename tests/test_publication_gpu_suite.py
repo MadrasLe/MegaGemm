@@ -72,6 +72,7 @@ def test_fast_profile_is_scoped_and_model_specific(monkeypatch):
         e2b_env["MEGAGEMM_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD"]
         == "1"
     )
+    assert e2b_env["MEGAGEMM_GEMMA4_E2B_L4_B8_FUSED_SOFTCAP_ARGMAX"] == "1"
     assert "MEGAGEMM_DECODE_PREFER_STEP" not in e2b_env
     assert "MEGAGEMM_DECODE_CUDA_GRAPHS" not in e2b_env
     assert "MEGAGEMM_DECODE_CUDA_GRAPHS_PREFER_STEP" not in e2b_env
@@ -419,6 +420,7 @@ def test_e2b_audit_proves_batch8_cublas_mlp_policy_and_zero_fusion_hits(tmp_path
             "gemma4_flat_deepfusion_hits": 0,
             "gemma4_batch_cublas_lm_head_enabled": True,
             "gemma4_e2b_l4_b8_batch_cublas_lm_head_enabled": True,
+            "gemma4_e2b_l4_b8_fused_softcap_argmax_enabled": True,
             "gemma4_batch_cublas_lm_head_hits": 127,
             "gemma4_batch_fused_softcap_argmax_hits": 127,
             "gemma4_batch_fused_softcap_argmax_disabled": False,
@@ -533,6 +535,7 @@ def test_e2b_audit_requires_promoted_l4_long_sliding_prefill_hits(tmp_path):
             "gemma4_flat_deepfusion_hits": 0,
             "gemma4_batch_cublas_lm_head_enabled": True,
             "gemma4_e2b_l4_b8_batch_cublas_lm_head_enabled": True,
+            "gemma4_e2b_l4_b8_fused_softcap_argmax_enabled": True,
             "gemma4_batch_cublas_lm_head_hits": 127,
             "gemma4_batch_fused_softcap_argmax_hits": 127,
             "gemma4_batch_fused_softcap_argmax_disabled": False,

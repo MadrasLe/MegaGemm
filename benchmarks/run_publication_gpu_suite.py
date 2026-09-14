@@ -77,6 +77,7 @@ GEMMA4_E2B_FAST_PROFILE = {
     **GEMMA4_DENSE_COMMON_PROFILE,
     "MEGAGEMM_DISABLE_CUDA_RMSNORM": "1",
     "MEGAGEMM_GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD": "1",
+    "MEGAGEMM_GEMMA4_E2B_L4_B8_FUSED_SOFTCAP_ARGMAX": "1",
 }
 
 
@@ -685,6 +686,7 @@ def audit_gemma4_dense_fast_path(path: Path, profile: str) -> dict:
         and all(
             stats.get("gemma4_batch_cublas_lm_head_enabled")
             and stats.get("gemma4_e2b_l4_b8_batch_cublas_lm_head_enabled")
+            and stats.get("gemma4_e2b_l4_b8_fused_softcap_argmax_enabled")
             for stats in batch8_decode_stats
         )
     )

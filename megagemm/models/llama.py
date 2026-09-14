@@ -609,6 +609,14 @@ _GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD = _env_enabled(
     # BF16 softcap collapsed different raw logits to equal capped values.
     default=True,
 )
+_GEMMA4_E2B_L4_B8_FUSED_SOFTCAP_ARGMAX = (
+    HAS_FUSED_SOFTCAP_ARGMAX
+    and logits_softcap_argmax is not None
+    and _env_enabled(
+        "MEGAGEMM_GEMMA4_E2B_L4_B8_FUSED_SOFTCAP_ARGMAX",
+        default=True,
+    )
+)
 _GEMMA4_BATCH_FUSED_SOFTCAP_ARGMAX = (
     HAS_FUSED_SOFTCAP_ARGMAX
     and logits_softcap_argmax is not None
@@ -12342,7 +12350,13 @@ class MegaGemmLlama(nn.Module):
             # value. Apply it before argmax so ties match the logits contract.
             raw_logits = self._decode_raw_logits_from_hidden(hidden)
             if (
-                (_GEMMA4_BATCH_FUSED_SOFTCAP_ARGMAX or promoted_e2b_l4_b8)
+                (
+                    _GEMMA4_BATCH_FUSED_SOFTCAP_ARGMAX
+                    or (
+                        promoted_e2b_l4_b8
+                        and _GEMMA4_E2B_L4_B8_FUSED_SOFTCAP_ARGMAX
+                    )
+                )
                 and logits_softcap_argmax is not None
                 and not self._gemma4_batch_fused_softcap_argmax_disable
                 and self.final_logit_softcapping > 0
@@ -15575,6 +15589,9 @@ class MegaGemmLlama(nn.Module):
             ),
             "gemma4_e2b_l4_b8_batch_cublas_lm_head_enabled": bool(
                 _GEMMA4_E2B_L4_B8_BATCH_CUBLAS_LM_HEAD
+            ),
+            "gemma4_e2b_l4_b8_fused_softcap_argmax_enabled": bool(
+                _GEMMA4_E2B_L4_B8_FUSED_SOFTCAP_ARGMAX
             ),
             "gemma4_batch_cublas_lm_head_hits": int(
                 getattr(self, "_gemma4_batch_cublas_lm_head_hits", 0)
