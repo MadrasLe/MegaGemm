@@ -132,6 +132,9 @@ def _evaluate_hidden(model: Any, hidden: Any, step: int) -> dict[str, Any]:
         direct_value = torch.gather(
             final_logits, 1, direct_rmsnorm_fused.unsqueeze(1)
         ).squeeze(1)
+        softcap_value = torch.gather(
+            final_logits, 1, softcap_fused.unsqueeze(1)
+        ).squeeze(1)
         normed_value = torch.gather(
             final_logits, 1, direct_normed_fused.unsqueeze(1)
         ).squeeze(1)
@@ -142,6 +145,7 @@ def _evaluate_hidden(model: Any, hidden: Any, step: int) -> dict[str, Any]:
     rms_ids = _as_ints(direct_rmsnorm_fused)
     normed_ids = _as_ints(direct_normed_fused)
     oracle_values = [float(value) for value in oracle_value.float().cpu().tolist()]
+    softcap_values = [float(value) for value in softcap_value.float().cpu().tolist()]
     rms_values = [float(value) for value in direct_value.float().cpu().tolist()]
     normed_values = [float(value) for value in normed_value.float().cpu().tolist()]
 
@@ -158,8 +162,12 @@ def _evaluate_hidden(model: Any, hidden: Any, step: int) -> dict[str, Any]:
                 "direct_rmsnorm_matches_canonical": rms_ids[row] == canonical_ids[row],
                 "direct_normed_matches_canonical": normed_ids[row] == canonical_ids[row],
                 "canonical_capped_value": oracle_values[row],
+                "tensorcore_softcap_capped_value": softcap_values[row],
                 "direct_rmsnorm_capped_value": rms_values[row],
                 "direct_normed_capped_value": normed_values[row],
+                "canonical_minus_tensorcore_softcap": (
+                    oracle_values[row] - softcap_values[row]
+                ),
                 "canonical_minus_direct_rmsnorm": oracle_values[row] - rms_values[row],
                 "canonical_minus_direct_normed": oracle_values[row] - normed_values[row],
                 "raw_top1_minus_top2": float(
@@ -192,11 +200,11 @@ def _agreement(steps: list[dict[str, Any]], key: str) -> dict[str, Any]:
             if row[key]:
                 matches += 1
                 continue
-            margin_key = (
-                "canonical_minus_direct_rmsnorm"
-                if key == "direct_rmsnorm_matches_canonical"
-                else "canonical_minus_direct_normed"
-            )
+            margin_key = {
+                "softcap_matches_canonical": "canonical_minus_tensorcore_softcap",
+                "direct_rmsnorm_matches_canonical": "canonical_minus_direct_rmsnorm",
+                "direct_normed_matches_canonical": "canonical_minus_direct_normed",
+            }[key]
             margin = float(row.get(margin_key, math.nan))
             if math.isfinite(margin) and margin > 0.0:
                 positive_oracle_margin += 1
