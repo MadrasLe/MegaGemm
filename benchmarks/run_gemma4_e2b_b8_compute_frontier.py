@@ -77,6 +77,11 @@ class ComputeCase:
     mlp_tc_split_k: int = 1
     ple_conditioned: bool = False
     ple_block_size: int = 256
+    ple_projection: bool = False
+    ple_projection_block_n: int = 64
+    ple_projection_block_k: int = 32
+    ple_projection_warps: int = 4
+    ple_projection_stages: int = 2
 
     def h512_segments(self, prompt_tokens: int) -> int:
         return (
@@ -255,6 +260,44 @@ SCREEN_CASES = (
         ple_conditioned=True,
         ple_block_size=1024,
     ),
+    # Fuse the BF16-staged PLE GELU/condition multiply directly into the
+    # exact M8/K256/N1536 projection.  These are full-model candidates; no
+    # isolated microbenchmark is used for promotion.
+    ComputeCase(
+        "ple_proj_bn32_bk32_w4_s2",
+        "ple",
+        ple_projection=True,
+        ple_projection_block_n=32,
+    ),
+    ComputeCase(
+        "ple_proj_bn64_bk32_w4_s2",
+        "ple",
+        ple_projection=True,
+    ),
+    ComputeCase(
+        "ple_proj_bn128_bk32_w4_s2",
+        "ple",
+        ple_projection=True,
+        ple_projection_block_n=128,
+    ),
+    ComputeCase(
+        "ple_proj_bn64_bk64_w4_s2",
+        "ple",
+        ple_projection=True,
+        ple_projection_block_k=64,
+    ),
+    ComputeCase(
+        "ple_proj_bn64_bk32_w8_s2",
+        "ple",
+        ple_projection=True,
+        ple_projection_warps=8,
+    ),
+    ComputeCase(
+        "ple_proj_bn64_bk32_w4_s3",
+        "ple",
+        ple_projection=True,
+        ple_projection_stages=3,
+    ),
 )
 
 FINAL_WORKLOADS = tuple(
@@ -328,6 +371,7 @@ COUNTER_KEYS = (
     "gemma4_e2b_b8_gated_activation_hits",
     "gemma4_e2b_b8_tensorcore_down_hits",
     "gemma4_ple_conditioned_gelu_decode_hits",
+    "gemma4_e2b_b8_fused_ple_projection_hits",
 )
 
 
@@ -406,6 +450,9 @@ def _restore_mlp_state(model: Any, state: dict[str, Any]) -> None:
     model._gemma4_flat_ple_conditioned_gelu_enabled = False
     model._gemma4_flat_ple_conditioned_gelu_runtime_disabled = False
     model._gemma4_flat_ple_conditioned_gelu_first_failure = ""
+    model._gemma4_flat_b8_fused_ple_projection_enabled = False
+    model._gemma4_flat_b8_fused_ple_projection_runtime_disabled = False
+    model._gemma4_flat_b8_fused_ple_projection_failure = ""
 
 
 def _apply_case(
@@ -475,6 +522,15 @@ def _apply_case(
         )
     model._gemma4_flat_ple_conditioned_gelu_enabled = bool(case.ple_conditioned)
     model._gemma4_flat_ple_conditioned_gelu_block_size = int(case.ple_block_size)
+    model._gemma4_flat_b8_fused_ple_projection_enabled = bool(
+        case.ple_projection
+    )
+    model._gemma4_flat_b8_fused_ple_projection_config = (
+        int(case.ple_projection_block_n),
+        int(case.ple_projection_block_k),
+        int(case.ple_projection_warps),
+        int(case.ple_projection_stages),
+    )
 
 
 def _graph_errors(row: dict[str, Any]) -> list[str]:
@@ -824,6 +880,30 @@ def _route_errors(
             case.ple_block_size
         ):
             errors.append("fused PLE conditioned GELU selected the wrong block size")
+    if case.ple_projection:
+        if not delta["gemma4_e2b_b8_fused_ple_projection_hits"]:
+            errors.append("requested fused PLE projection route produced no hits")
+        if runtime_stats.get(
+            "gemma4_e2b_b8_fused_ple_projection_runtime_disabled"
+        ):
+            errors.append(
+                "fused PLE projection disabled at runtime: "
+                + str(
+                    runtime_stats.get(
+                        "gemma4_e2b_b8_fused_ple_projection_failure"
+                    )
+                )
+            )
+        expected = [
+            int(case.ple_projection_block_n),
+            int(case.ple_projection_block_k),
+            int(case.ple_projection_warps),
+            int(case.ple_projection_stages),
+        ]
+        if runtime_stats.get(
+            "gemma4_e2b_b8_fused_ple_projection_config"
+        ) != expected:
+            errors.append("fused PLE projection selected the wrong launch config")
     return errors
 
 
@@ -1006,6 +1086,11 @@ def combine_family_winners(
         mlp_tc_split_k=mlp_core.mlp_tc_split_k,
         ple_conditioned=ple.ple_conditioned,
         ple_block_size=ple.ple_block_size,
+        ple_projection=ple.ple_projection,
+        ple_projection_block_n=ple.ple_projection_block_n,
+        ple_projection_block_k=ple.ple_projection_block_k,
+        ple_projection_warps=ple.ple_projection_warps,
+        ple_projection_stages=ple.ple_projection_stages,
     )
     return combined
 

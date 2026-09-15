@@ -130,6 +130,71 @@ def _mg_conditioned_gelu_tanh_fwd_kernel(
 
 
 @triton.jit
+def _mg_gemma4_e2b_b8_conditioned_gelu_projection_kernel(
+    gate_ptr,
+    condition_ptr,
+    weight_ptr,
+    output_ptr,
+    GATE_STRIDE_ROW: tl.constexpr,
+    GATE_STRIDE_COL: tl.constexpr,
+    CONDITION_STRIDE_ROW: tl.constexpr,
+    CONDITION_STRIDE_COL: tl.constexpr,
+    WEIGHT_STRIDE_K: tl.constexpr,
+    WEIGHT_STRIDE_N: tl.constexpr,
+    OUTPUT_STRIDE_ROW: tl.constexpr,
+    OUTPUT_STRIDE_COL: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Exact-shape Gemma 4 E2B PLE activation + projection."""
+    offs_m = tl.arange(0, 16)
+    offs_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    accumulator = tl.zeros((16, BLOCK_N), dtype=tl.float32)
+
+    for k_start in range(0, 256, BLOCK_K):
+        k = k_start + offs_k
+        gate = tl.load(
+            gate_ptr
+            + offs_m[:, None] * GATE_STRIDE_ROW
+            + k[None, :] * GATE_STRIDE_COL,
+            mask=offs_m[:, None] < 8,
+            other=0.0,
+        ).to(tl.float32)
+        condition = tl.load(
+            condition_ptr
+            + offs_m[:, None] * CONDITION_STRIDE_ROW
+            + k[None, :] * CONDITION_STRIDE_COL,
+            mask=offs_m[:, None] < 8,
+            other=0.0,
+        ).to(tl.float32)
+        inner = 0.7978845608028654 * (
+            gate + 0.044715 * gate * gate * gate
+        )
+        gelu_bf16 = (
+            0.5 * gate * (1.0 + libdevice.tanh(inner))
+        ).to(tl.bfloat16)
+        # Production stores after the in-place condition multiply too.
+        activated = (gelu_bf16.to(tl.float32) * condition).to(tl.bfloat16)
+        weight = tl.load(
+            weight_ptr
+            + k[:, None] * WEIGHT_STRIDE_K
+            + offs_n[None, :] * WEIGHT_STRIDE_N,
+            mask=offs_n[None, :] < 1536,
+            other=0.0,
+        )
+        accumulator += tl.dot(activated, weight, out_dtype=tl.float32)
+
+    tl.store(
+        output_ptr
+        + offs_m[:, None] * OUTPUT_STRIDE_ROW
+        + offs_n[None, :] * OUTPUT_STRIDE_COL,
+        accumulator,
+        mask=(offs_m[:, None] < 8) & (offs_n[None, :] < 1536),
+    )
+
+
+@triton.jit
 def _mg_swiglu_bwd_kernel(
     grad_out_ptr,    # [M, H]
     input_ptr,       # [M, 2H]
@@ -382,6 +447,75 @@ def conditioned_gelu_tanh_forward(
         BLOCK_SIZE=int(block_size),
         num_warps=4 if block_size >= 256 else 2,
         num_stages=1,
+    )
+    return output
+
+
+def gemma4_e2b_b8_conditioned_gelu_projection(
+    gate: torch.Tensor,
+    condition: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    out: torch.Tensor = None,
+    block_n: int = 64,
+    block_k: int = 32,
+    num_warps: int = 4,
+    num_stages: int = 2,
+) -> torch.Tensor:
+    """Fuse the exact E2B/L4/B8 PLE activation and ``256 -> 1536`` GEMM.
+
+    This is intentionally an exact-shape inference primitive.  The caller owns
+    policy selection and must retain the ordinary conditioned-GELU + cuBLAS
+    route as its fallback.
+    """
+    if not gate.is_cuda or not condition.is_cuda or not weight.is_cuda:
+        raise ValueError("Gemma4 E2B PLE projection requires CUDA tensors")
+    if gate.device != condition.device or gate.device != weight.device:
+        raise ValueError("gate, condition, and weight must share one CUDA device")
+    if gate.dtype != torch.bfloat16 or condition.dtype != torch.bfloat16:
+        raise ValueError("gate and condition must be BF16")
+    if weight.dtype != torch.bfloat16:
+        raise ValueError("weight must be BF16")
+    if tuple(gate.shape) != (8, 256) or tuple(condition.shape) != (8, 256):
+        raise ValueError("expected exact gate and condition shape [8, 256]")
+    if tuple(weight.shape) != (256, 1536):
+        raise ValueError("expected transposed projection weight [256, 1536]")
+    if gate.stride(1) != 1 or condition.stride(1) != 1:
+        raise ValueError("gate and condition need a contiguous last dimension")
+    if block_n not in (32, 64, 128) or block_k not in (32, 64):
+        raise ValueError("unsupported Tensor Core tile")
+    if num_warps not in (4, 8) or num_stages not in (2, 3, 4):
+        raise ValueError("unsupported Triton launch geometry")
+
+    if out is None:
+        output = torch.empty((8, 1536), device=gate.device, dtype=gate.dtype)
+    else:
+        if tuple(out.shape) != (8, 1536):
+            raise ValueError("out must have shape [8, 1536]")
+        if out.device != gate.device or out.dtype != gate.dtype:
+            raise ValueError("out must match the gate device and dtype")
+        if out.stride(1) != 1:
+            raise ValueError("out needs a contiguous last dimension")
+        output = out
+
+    grid = (triton.cdiv(1536, block_n),)
+    _mg_gemma4_e2b_b8_conditioned_gelu_projection_kernel[grid](
+        gate,
+        condition,
+        weight,
+        output,
+        GATE_STRIDE_ROW=int(gate.stride(0)),
+        GATE_STRIDE_COL=int(gate.stride(1)),
+        CONDITION_STRIDE_ROW=int(condition.stride(0)),
+        CONDITION_STRIDE_COL=int(condition.stride(1)),
+        WEIGHT_STRIDE_K=int(weight.stride(0)),
+        WEIGHT_STRIDE_N=int(weight.stride(1)),
+        OUTPUT_STRIDE_ROW=int(output.stride(0)),
+        OUTPUT_STRIDE_COL=int(output.stride(1)),
+        BLOCK_N=int(block_n),
+        BLOCK_K=int(block_k),
+        num_warps=int(num_warps),
+        num_stages=int(num_stages),
     )
     return output
 

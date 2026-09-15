@@ -172,12 +172,14 @@ try:
     from ..kernels.swiglu import (
         MegaGemmFunction,
         conditioned_gelu_tanh_forward,
+        gemma4_e2b_b8_conditioned_gelu_projection,
         gated_activation_forward,
         swiglu_forward,
     )
     _HAS_TRITON_SWIGLU = True
 except Exception:
     conditioned_gelu_tanh_forward = None
+    gemma4_e2b_b8_conditioned_gelu_projection = None
     gated_activation_forward = None
     swiglu_forward = None
     _HAS_TRITON_SWIGLU = False
@@ -11567,6 +11569,11 @@ class MegaGemmLlama(nn.Module):
         self._gemma4_flat_b8_tensorcore_down_runtime_disabled = False
         self._gemma4_flat_b8_tensorcore_down_failure = ""
         self._gemma4_flat_ple_conditioned_gelu_block_size = 256
+        self._gemma4_flat_b8_fused_ple_projection_enabled = False
+        self._gemma4_flat_b8_fused_ple_projection_config = (64, 32, 4, 2)
+        self._gemma4_flat_b8_fused_ple_projection_hits = 0
+        self._gemma4_flat_b8_fused_ple_projection_runtime_disabled = False
+        self._gemma4_flat_b8_fused_ple_projection_failure = ""
         self._gemma4_flat_cublaslt_gateup_enabled = False
         self._gemma4_flat_cublaslt_gateup_hits = 0
         self._gemma4_flat_cublaslt_gateup_runtime_disabled = False
@@ -15248,6 +15255,37 @@ class MegaGemmLlama(nn.Module):
                     "",
                 )
             ),
+            "gemma4_e2b_b8_fused_ple_projection_enabled": bool(
+                getattr(
+                    self,
+                    "_gemma4_flat_b8_fused_ple_projection_enabled",
+                    False,
+                )
+            ),
+            "gemma4_e2b_b8_fused_ple_projection_config": list(
+                getattr(
+                    self,
+                    "_gemma4_flat_b8_fused_ple_projection_config",
+                    (),
+                )
+            ),
+            "gemma4_e2b_b8_fused_ple_projection_hits": int(
+                getattr(self, "_gemma4_flat_b8_fused_ple_projection_hits", 0)
+            ),
+            "gemma4_e2b_b8_fused_ple_projection_runtime_disabled": bool(
+                getattr(
+                    self,
+                    "_gemma4_flat_b8_fused_ple_projection_runtime_disabled",
+                    False,
+                )
+            ),
+            "gemma4_e2b_b8_fused_ple_projection_failure": str(
+                getattr(
+                    self,
+                    "_gemma4_flat_b8_fused_ple_projection_failure",
+                    "",
+                )
+            ),
             "gemma4_e2b_b8_gated_activation_enabled": bool(
                 getattr(self, "_gemma4_flat_b8_gated_activation_enabled", False)
             ),
@@ -17061,6 +17099,9 @@ class MegaGemmLlama(nn.Module):
             self._gemma4_flat_ple_conditioned_gelu_hits = 0
             self._gemma4_flat_ple_conditioned_gelu_runtime_disabled = False
             self._gemma4_flat_ple_conditioned_gelu_first_failure = ""
+            self._gemma4_flat_b8_fused_ple_projection_hits = 0
+            self._gemma4_flat_b8_fused_ple_projection_runtime_disabled = False
+            self._gemma4_flat_b8_fused_ple_projection_failure = ""
             self._gemma4_flat_deepfusion_hits = 0
             self._gemma4_mlp_fusion_debug_seen = set()
             self._flat_int8_inline = False
@@ -17718,6 +17759,30 @@ class MegaGemmLlama(nn.Module):
             self._gemma4_flat_ple_conditioned_gelu_block_size = _env_int(
                 "MEGAGEMM_GEMMA4_PLE_CONDITIONED_GELU_BLOCK_SIZE",
                 256,
+            )
+            self._gemma4_flat_b8_fused_ple_projection_enabled = bool(
+                _env_enabled(
+                    "MEGAGEMM_GEMMA4_E2B_B8_FUSED_PLE_PROJECTION_DECODE",
+                    default=False,
+                )
+                and callable(gemma4_e2b_b8_conditioned_gelu_projection)
+                and self.runtime_policy.name == "gemma4-e2b-l4"
+                and int(batch_size) == 8
+                and dtype == torch.bfloat16
+                and int(self._flat_hidden_size) == 1536
+                and int(self.hidden_size_per_layer_input) == 256
+                and all(
+                    int(lw.ple_size) == 256
+                    and lw.ple_proj_wt is not None
+                    and tuple(lw.ple_proj_wt.shape) == (256, 1536)
+                    for lw in weights
+                )
+            )
+            self._gemma4_flat_b8_fused_ple_projection_config = (
+                _env_int("MEGAGEMM_GEMMA4_E2B_B8_PLE_PROJ_BLOCK_N", 64),
+                _env_int("MEGAGEMM_GEMMA4_E2B_B8_PLE_PROJ_BLOCK_K", 32),
+                _env_int("MEGAGEMM_GEMMA4_E2B_B8_PLE_PROJ_WARPS", 4),
+                _env_int("MEGAGEMM_GEMMA4_E2B_B8_PLE_PROJ_STAGES", 2),
             )
             b8_large_mlp_supported = bool(
                 self.runtime_policy.name == "gemma4-e2b-l4"
@@ -19692,8 +19757,49 @@ class MegaGemmLlama(nn.Module):
                     self._gemma4_flat_ple_gate_bufs[layer_idx],
                 )
                 ple_condition = per_layer_inputs[:, 0, layer_idx, :]
-                use_conditioned_gelu = bool(
+                use_fused_ple_projection = bool(
                     getattr(
+                        self,
+                        "_gemma4_flat_b8_fused_ple_projection_enabled",
+                        False,
+                    )
+                    and not getattr(
+                        self,
+                        "_gemma4_flat_b8_fused_ple_projection_runtime_disabled",
+                        False,
+                    )
+                    and tuple(ple.shape) == (8, 256)
+                    and tuple(ple_condition.shape) == (8, 256)
+                    and lw.ple_proj_wt is not None
+                    and tuple(lw.ple_proj_wt.shape) == (256, 1536)
+                )
+                if use_fused_ple_projection:
+                    block_n, block_k, num_warps, num_stages = (
+                        self._gemma4_flat_b8_fused_ple_projection_config
+                    )
+                    try:
+                        ple_proj = gemma4_e2b_b8_conditioned_gelu_projection(
+                            ple,
+                            ple_condition,
+                            lw.ple_proj_wt,
+                            out=self._gemma4_flat_ple_proj_bufs[layer_idx],
+                            block_n=block_n,
+                            block_k=block_k,
+                            num_warps=num_warps,
+                            num_stages=num_stages,
+                        )
+                    except Exception as exc:
+                        self._gemma4_flat_b8_fused_ple_projection_runtime_disabled = True
+                        if not self._gemma4_flat_b8_fused_ple_projection_failure:
+                            self._gemma4_flat_b8_fused_ple_projection_failure = (
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                        ple_proj = None
+                    else:
+                        self._gemma4_flat_b8_fused_ple_projection_hits += 1
+                use_conditioned_gelu = bool(
+                    ple_proj is None
+                    and getattr(
                         self,
                         "_gemma4_flat_ple_conditioned_gelu_enabled",
                         False,
@@ -19725,15 +19831,16 @@ class MegaGemmLlama(nn.Module):
                         use_conditioned_gelu = False
                     else:
                         self._gemma4_flat_ple_conditioned_gelu_hits += 1
-                if not use_conditioned_gelu:
+                if ple_proj is None and not use_conditioned_gelu:
                     ple = torch.nn.functional.gelu(ple, approximate='tanh')
                     ple.mul_(ple_condition)
-                ple_proj = self._gemma4_flat_fp_linear(
-                    ple,
-                    lw.ple_proj_wt,
-                    None,
-                    self._gemma4_flat_ple_proj_bufs[layer_idx],
-                )
+                if ple_proj is None:
+                    ple_proj = self._gemma4_flat_fp_linear(
+                        ple,
+                        lw.ple_proj_wt,
+                        None,
+                        self._gemma4_flat_ple_proj_bufs[layer_idx],
+                    )
                 if not dense_post_norm_chain:
                     ple_normed = self._gemma4_flat_rmsnorm(
                         ple_proj,
