@@ -617,6 +617,113 @@ def _tensorcore_preflight_passes(
     )
 
 
+def _run_ple_projection_numeric_preflight(
+    model: Any,
+    case: ComputeCase,
+    *,
+    min_cosine: float,
+    max_relative_l2: float,
+    max_relative_linf: float,
+) -> dict[str, Any]:
+    """Compile and validate one fused PLE tile before CUDA Graph capture."""
+    import torch
+    import torch.nn.functional as functional
+    from megagemm.kernels.swiglu import (
+        gemma4_e2b_b8_conditioned_gelu_projection,
+    )
+
+    layer = next(
+        (
+            item
+            for item in getattr(model, "_flat_layer_weights", ())
+            if getattr(item, "ple_proj_wt", None) is not None
+            and tuple(item.ple_proj_wt.shape) == (256, 1536)
+        ),
+        None,
+    )
+    if layer is None:
+        raise RuntimeError("no exact E2B PLE projection weight is available")
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(20260914)
+    gate = torch.randn(
+        (8, 256), device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    # Preserve the real strided condition layout used by
+    # per_layer_inputs[:, 0, layer_idx, :].
+    condition_storage = torch.randn(
+        (8, 35, 256),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    condition = condition_storage[:, 17, :]
+    activated = functional.gelu(gate, approximate="tanh")
+    activated.mul_(condition)
+    reference = torch.empty(
+        (8, 1536), device="cuda", dtype=torch.bfloat16
+    )
+    torch.mm(activated, layer.ple_proj_wt, out=reference)
+    first = torch.empty_like(reference)
+    second = torch.empty_like(reference)
+    config = {
+        "block_n": int(case.ple_projection_block_n),
+        "block_k": int(case.ple_projection_block_k),
+        "num_warps": int(case.ple_projection_warps),
+        "num_stages": int(case.ple_projection_stages),
+    }
+    error = ""
+    try:
+        gemma4_e2b_b8_conditioned_gelu_projection(
+            gate, condition, layer.ple_proj_wt, out=first, **config
+        )
+        gemma4_e2b_b8_conditioned_gelu_projection(
+            gate, condition, layer.ple_proj_wt, out=second, **config
+        )
+        torch.cuda.synchronize()
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    if error:
+        return {
+            "passed": False,
+            "error": error,
+            "config": config,
+            "strided_condition": not condition.is_contiguous(),
+        }
+
+    candidate = first.float()
+    reference_fp32 = reference.float()
+    delta = candidate - reference_fp32
+    reference_l2 = float(torch.linalg.vector_norm(reference_fp32).item())
+    reference_linf = float(reference_fp32.abs().max().item())
+    max_abs = float(delta.abs().max().item())
+    metrics = {
+        "finite": bool(torch.isfinite(first).all().item()),
+        "repeat_exact": bool(torch.equal(first, second)),
+        "max_abs_error": max_abs,
+        "mean_abs_error": float(delta.abs().mean().item()),
+        "relative_l2_error": float(torch.linalg.vector_norm(delta).item())
+        / max(reference_l2, 1.0e-12),
+        "relative_linf_error": max_abs / max(reference_linf, 1.0e-12),
+        "cosine": float(
+            functional.cosine_similarity(
+                candidate.flatten(), reference_fp32.flatten(), dim=0
+            ).item()
+        ),
+    }
+    return {
+        "passed": _tensorcore_preflight_passes(
+            metrics,
+            min_cosine=min_cosine,
+            max_relative_l2=max_relative_l2,
+            max_relative_linf=max_relative_linf,
+        ),
+        "error": "",
+        "config": config,
+        "strided_condition": not condition.is_contiguous(),
+        "metrics": metrics,
+    }
+
+
 def _capture_tensorcore_preflight_fixtures(model: Any) -> list[dict[str, Any]]:
     """Capture actual decode activations and weights from every target layer.
 
@@ -1270,6 +1377,7 @@ def main(argv: list[str] | None = None) -> int:
     short_references: dict[int, dict[str, Any]] = {}
     case_references: dict[str, dict[str, Any]] = {}
     tensorcore_preflights: dict[str, dict[str, Any]] = {}
+    ple_projection_preflights: dict[str, dict[str, Any]] = {}
     setup_audits: dict[str, Any] = {}
     phase_samples: dict[str, list[dict[str, Any]]] = {
         "screen": [],
@@ -1286,6 +1394,7 @@ def main(argv: list[str] | None = None) -> int:
             "stage": stage,
             "model_loads": 1,
             "tensorcore_numeric_preflights": tensorcore_preflights,
+            "ple_projection_numeric_preflights": ple_projection_preflights,
             "setup_audits": setup_audits,
             "screen_samples": phase_samples["screen"],
             "final_samples": phase_samples["final"],
@@ -1300,6 +1409,33 @@ def main(argv: list[str] | None = None) -> int:
         row = _run(engine, prompts[workload.prompt_tokens], workload.output_tokens)
         schedulers[key] = engine._last_scheduler
         return row
+
+    # Triton JIT compilation cannot occur safely inside CUDA Graph capture.
+    # Compile and validate every requested PLE tile before any candidate graph
+    # is created.  This is setup-only work and never enters a timing sample.
+    for case in screen_cases:
+        if not case.ple_projection:
+            continue
+        key = (
+            f"bn{case.ple_projection_block_n}_"
+            f"bk{case.ple_projection_block_k}_"
+            f"w{case.ple_projection_warps}_"
+            f"s{case.ple_projection_stages}"
+        )
+        ple_projection_preflights[key] = _run_ple_projection_numeric_preflight(
+            model,
+            case,
+            min_cosine=args.tensorcore_min_cosine,
+            max_relative_l2=args.tensorcore_max_relative_l2,
+            max_relative_linf=args.tensorcore_max_relative_linf,
+        )
+        print(
+            "PLE PROJECTION NUMERIC PREFLIGHT "
+            + key
+            + " "
+            + json.dumps(ple_projection_preflights[key], sort_keys=True),
+            flush=True,
+        )
 
     # Production references are captured once per exact workload and reused for
     # all natural-greedy correctness checks.
@@ -1386,6 +1522,19 @@ def main(argv: list[str] | None = None) -> int:
                 numeric_errors.append(
                     "Tensor Core real-weight numeric preflight failed"
                 )
+            if case.ple_projection:
+                ple_key = (
+                    f"bn{case.ple_projection_block_n}_"
+                    f"bk{case.ple_projection_block_k}_"
+                    f"w{case.ple_projection_warps}_"
+                    f"s{case.ple_projection_stages}"
+                )
+                if not ple_projection_preflights.get(ple_key, {}).get(
+                    "passed"
+                ):
+                    numeric_errors.append(
+                        "fused PLE projection numeric preflight failed"
+                    )
             short_errors_by_prompt: dict[int, list[str]] = {}
             short_comparisons_by_prompt: dict[int, dict[str, Any]] = {}
             for prompt_tokens in sorted(
@@ -1673,6 +1822,7 @@ def main(argv: list[str] | None = None) -> int:
         "final_samples": final_samples,
         "decision": decision,
         "tensorcore_numeric_preflights": tensorcore_preflights,
+        "ple_projection_numeric_preflights": ple_projection_preflights,
         "setup_audits": setup_audits,
         "excluded_by_existing_evidence": excluded,
     }

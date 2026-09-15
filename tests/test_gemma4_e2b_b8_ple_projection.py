@@ -72,6 +72,24 @@ def test_frontier_sweeps_ple_projection_tiles_and_combines_winner():
     assert combined.ple_projection_block_n == 128
 
 
+def test_frontier_precompiles_ple_kernel_before_graph_capture():
+    source = (
+        ROOT / "benchmarks" / "run_gemma4_e2b_b8_compute_frontier.py"
+    ).read_text(encoding="utf-8")
+    preflight = source.index("def _run_ple_projection_numeric_preflight(")
+    graph_setup = source.index("def setup_cases(")
+    assert preflight < graph_setup
+    for expected in (
+        "condition_storage[:, 17, :]",
+        "torch.mm(activated, layer.ple_proj_wt, out=reference)",
+        "repeat_exact",
+        "relative_l2_error",
+        "PLE PROJECTION NUMERIC PREFLIGHT",
+        "Triton JIT compilation cannot occur safely inside CUDA Graph capture",
+    ):
+        assert expected in source
+
+
 def test_colab_gate_uses_drive_and_one_load_full_model_frontier():
     source = HARNESS.read_text(encoding="utf-8")
     assert 'REPO="${REPO:-/content/drive/MyDrive/mg/MGRrmsnorm}"' in source
